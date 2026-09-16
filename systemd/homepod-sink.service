@@ -1,0 +1,15 @@
+[Unit]
+Description=HomePod AirPlay audio sink (PipeWire virtual output)
+# PipeWire must be up first so the virtual sink node can be created.
+After=pipewire.service pipewire-session-manager.service
+Wants=pipewire.service pipewire-session-manager.service
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/homepod-sink/homepod-sink.env
+ExecStart=%h/src/homepod-sink/systemd/run.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
