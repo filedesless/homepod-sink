@@ -13,9 +13,17 @@ use airplay_core::{AudioCodec, StreamConfig};
 /// stream it to a HomePod / AirPlay speaker.
 #[derive(Parser, Debug)]
 struct Args {
-    /// IP address of the AirPlay device (see `debug_devices` in airplay2-rs to find it).
+    /// IP address of the AirPlay device. If omitted, discovers devices on
+    /// the network instead: connects automatically if exactly one is found,
+    /// otherwise lists what was found and exits.
     #[arg(long)]
-    ip: String,
+    ip: Option<String>,
+
+    /// Name (or substring of the name) of the AirPlay device to select
+    /// during discovery. Only used when --ip is omitted and more than one
+    /// device is found.
+    #[arg(long)]
+    name: Option<String>,
 
     /// AirPlay control port.
     #[arg(long, default_value_t = 7000)]
@@ -86,26 +94,39 @@ async fn connect_airplay(args: &Args, decoder: LiveAudioDecoder) -> Result<()> {
     let mut client = AirPlayClient::with_config(config, None)
         .context("failed to create AirPlay client")?;
 
-    let ip: std::net::IpAddr = args.ip.parse().context("invalid --ip address")?;
-    let octets = match ip {
-        std::net::IpAddr::V4(v4) => v4.octets(),
-        _ => anyhow::bail!("only IPv4 addresses are supported for now"),
-    };
-    let device_id_str = format!(
-        "{:02X}:{:02X}:{:02X}:{:02X}:00:00",
-        octets[0], octets[1], octets[2], octets[3]
-    );
-    let derived_id = DeviceId::from_mac_string(&device_id_str)
-        .map_err(|e| anyhow::anyhow!("failed to build device id: {e:?}"))?;
-
     tracing::info!("discovering AirPlay devices...");
     let devices = client.discover(Duration::from_secs(5)).await?;
-    let device = devices
-        .into_iter()
-        .find(|d| d.id == derived_id || d.addresses.iter().any(|a| *a == ip))
-        .with_context(|| format!("device at {} not found during discovery", args.ip))?;
 
-    tracing::info!("connecting to {} ({})...", device.name, args.ip);
+    let device = match &args.ip {
+        Some(ip_str) => {
+            let ip: std::net::IpAddr = ip_str.parse().context("invalid --ip address")?;
+            let octets = match ip {
+                std::net::IpAddr::V4(v4) => v4.octets(),
+                _ => anyhow::bail!("only IPv4 addresses are supported for now"),
+            };
+            let device_id_str = format!(
+                "{:02X}:{:02X}:{:02X}:{:02X}:00:00",
+                octets[0], octets[1], octets[2], octets[3]
+            );
+            let derived_id = DeviceId::from_mac_string(&device_id_str)
+                .map_err(|e| anyhow::anyhow!("failed to build device id: {e:?}"))?;
+
+            devices
+                .into_iter()
+                .find(|d| d.id == derived_id || d.addresses.iter().any(|a| *a == ip))
+                .with_context(|| format!("device at {ip_str} not found during discovery"))?
+        }
+        None => select_discovered_device(devices, args.name.as_deref())?,
+    };
+
+    let device_ip = device
+        .addresses
+        .iter()
+        .find(|a| a.is_ipv4())
+        .or_else(|| device.addresses.first())
+        .map(|a| a.to_string())
+        .unwrap_or_default();
+    tracing::info!("connecting to {} ({})...", device.name, device_ip);
     client.connect(&device).await?;
 
     tracing::info!("starting live stream at {}Hz stereo", args.sample_rate);
@@ -142,6 +163,51 @@ async fn connect_airplay(args: &Args, decoder: LiveAudioDecoder) -> Result<()> {
     });
 
     Ok(())
+}
+
+/// Pick a device from a discovery scan when `--ip` wasn't given.
+///
+/// With a `--name` filter, matches devices whose name contains it
+/// (case-insensitive) and requires exactly one match. Without a filter,
+/// requires exactly one device to have been found at all. Either way,
+/// ambiguity is reported (listing every candidate's name/model/IP) rather
+/// than guessed at, since this also runs unattended under systemd.
+fn select_discovered_device(
+    devices: Vec<airplay_core::device::Device>,
+    name_filter: Option<&str>,
+) -> Result<airplay_core::device::Device> {
+    let candidates: Vec<_> = match name_filter {
+        Some(filter) => devices
+            .into_iter()
+            .filter(|d| d.name.to_lowercase().contains(&filter.to_lowercase()))
+            .collect(),
+        None => devices,
+    };
+
+    match candidates.len() {
+        0 => match name_filter {
+            Some(filter) => anyhow::bail!("no AirPlay device found matching --name \"{filter}\""),
+            None => anyhow::bail!("no AirPlay devices found"),
+        },
+        1 => Ok(candidates.into_iter().next().unwrap()),
+        _ => {
+            let mut msg = format!(
+                "found {} devices, pass --ip (or a more specific --name) to select one:\n",
+                candidates.len()
+            );
+            for d in &candidates {
+                let ip = d
+                    .addresses
+                    .iter()
+                    .find(|a| a.is_ipv4())
+                    .or_else(|| d.addresses.first())
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|| "?".to_string());
+                msg.push_str(&format!("  {}  ({})  {}\n", d.name, d.model, ip));
+            }
+            anyhow::bail!(msg)
+        }
+    }
 }
 
 fn read_stdin_pcm(sender: airplay_audio::LiveFrameSender, sample_rate: u32) -> Result<()> {
