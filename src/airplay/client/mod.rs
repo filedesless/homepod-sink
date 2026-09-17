@@ -7,7 +7,6 @@
 
 mod client;
 mod connection;
-mod group;
 mod playback;
 mod builder;
 mod events;
@@ -15,7 +14,6 @@ mod stats;
 
 pub use client::AirPlayClient;
 pub use connection::{Connection, StreamingParams};
-pub use group::{DeviceGroup, GroupMember};
 pub use playback::{PlaybackState, PlaybackInfo};
 pub use builder::ClientBuilder;
 pub use events::{ClientEvent, EventHandler, NoOpHandler, CallbackHandler};
@@ -32,8 +30,7 @@ pub use crate::airplay::audio::{LiveAudioDecoder, LiveFrameSender, LivePcmFrame}
 // project's single-device live-streaming path, but interleaved into
 // Connection/AudioStreamer's struct fields and hot-path match arms deeply
 // enough that surgically removing them risked introducing a bug in code
-// proven to work against a real HomePod) — see also the PTP stub in
-// crate::airplay::timing for the same tradeoff.
+// proven to work against a real HomePod).
 pub use crate::airplay::audio::{EqConfig, EqParams};
 pub use crate::airplay::audio::eq::MAX_GAIN_DB;
 pub use crate::airplay::audio::{SpatialMixer, SpatialParams, SpatialMode, SpatialSnapshot, Position, SpeakerConfig, SpeakerParams};

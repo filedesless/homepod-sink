@@ -19,7 +19,7 @@ use crate::airplay::crypto::keys::SharedSecret;
 use super::PlaybackState;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use tracing::{debug, info, warn};
-use crate::airplay::timing::{NtpTimingServer, ClockOffset, PtpMaster, PTP_EVENT_PORT, run_ptp_slave, run_bmca_yield_flow, run_ptp_group_master_flow};
+use crate::airplay::timing::{NtpTimingServer, ClockOffset};
 use crate::airplay::core::stream::TimingProtocol;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -208,16 +208,10 @@ pub struct Connection {
     control_stop: Arc<AtomicBool>,
     timing_task: Option<JoinHandle<()>>,
     timing_server: Option<NtpTimingServer>,
-    /// PTP master instance (sender IS the timing master)
-    ptp_master: Option<PtpMaster>,
-    /// Background task sending periodic PTP Sync messages
-    ptp_master_sync_task: Option<JoinHandle<()>>,
     /// Control port receiver (keeps the UDP socket alive so HomePod doesn't get ICMP unreachable)
     control_receiver: Option<Arc<RtpReceiver>>,
     /// Reverse connection to device's events port (required before RECORD)
     events_stream: Option<TcpStream>,
-    /// Remote PTP master clock identity (from BMCA yield flow)
-    ptp_master_clock_id: Option<[u8; 8]>,
     /// Render delay in ms added to NTP timestamps for extra retransmit headroom.
     render_delay_ms: u32,
     /// Equalizer configuration (set before streaming).
@@ -339,9 +333,6 @@ impl Connection {
             timing_tx: None,
             timing_task: None,
             timing_server: None,
-            ptp_master: None,
-            ptp_master_sync_task: None,
-            ptp_master_clock_id: None,
             control_receiver: None,
             control_task: None,
             control_stop: Arc::new(AtomicBool::new(false)),
@@ -507,9 +498,6 @@ impl Connection {
             timing_tx: None,
             timing_task: None,
             timing_server: None,
-            ptp_master: None,
-            ptp_master_sync_task: None,
-            ptp_master_clock_id: None,
             control_receiver: None,
             control_task: None,
             control_stop: Arc::new(AtomicBool::new(false)),
@@ -711,9 +699,6 @@ impl Connection {
             timing_tx: None,
             timing_task: None,
             timing_server: None,
-            ptp_master: None,
-            ptp_master_sync_task: None,
-            ptp_master_clock_id: None,
             control_receiver: None,
             control_task: None,
             control_stop: Arc::new(AtomicBool::new(false)),
@@ -741,29 +726,18 @@ impl Connection {
             self.stream_config.timing_protocol
         );
 
-        // Start timing server based on protocol
-        let local_timing_port = match self.stream_config.timing_protocol {
-            TimingProtocol::Ntp => {
-                // For NTP, we run a server that the receiver can sync to
-                let timing_server = NtpTimingServer::start(
-                    self.stream_config.audio_format.sample_rate.as_hz()
-                ).await?;
-                let port = timing_server.port();
-                tracing::info!("Started NTP timing server on port {}", port);
-                self.timing_server = Some(timing_server);
-                port
-            }
-            TimingProtocol::Ptp => {
-                // PTP mode determines whether sender is master (sends Sync) or slave (receives Sync).
-                // Master mode: for third-party receivers like Shairport-sync
-                // Slave mode: for HomePod multi-room where HomePod is the timing master
-                let mode_str = match self.stream_config.ptp_mode {
-                    crate::airplay::core::PtpMode::Master => "master (sender is timing reference)",
-                    crate::airplay::core::PtpMode::Slave => "slave (receiver is timing reference)",
-                };
-                tracing::info!("PTP timing: will act as {}", mode_str);
-                PTP_EVENT_PORT
-            }
+        // Start the NTP timing server the receiver syncs to. This connection
+        // always uses NTP timing (StreamConfig::realtime_ntp()) — PTP existed
+        // here only to back multi-room/stereo-pair group streaming, which
+        // this project doesn't use and has removed.
+        let local_timing_port = {
+            let timing_server = NtpTimingServer::start(
+                self.stream_config.audio_format.sample_rate.as_hz()
+            ).await?;
+            let port = timing_server.port();
+            tracing::info!("Started NTP timing server on port {}", port);
+            self.timing_server = Some(timing_server);
+            port
         };
 
         // SETUP Phase 1 (timing/event channels)
@@ -866,133 +840,13 @@ impl Connection {
             Err(_) => warn!("RECORD timeout (continuing anyway)"),
         }
 
-        // SETPEERS disabled — not needed for current receiver targets
-        // let local_addr_str = self.rtsp.local_addr()
-        //     .map(|sa| sa.ip().to_string())
-        //     .unwrap_or_else(|| "0.0.0.0".to_string());
-        // let device_addr_str = addr.to_string();
-        // {
-        //     let peer_addresses = vec![device_addr_str, local_addr_str];
-        //     tracing::debug!("Sending SETPEERS with addresses: {:?}", peer_addresses);
-        //     match self.send_setpeers(&peer_addresses).await {
-        //         Ok(()) => tracing::info!("SETPEERS sent"),
-        //         Err(e) => warn!("SETPEERS failed (continuing anyway): {}", e),
-        //     }
-        // }
-
-        // Timing sync - after stream is set up
-        match self.stream_config.timing_protocol {
-            TimingProtocol::Ntp => {
-                // For NTP, the sender IS the timing reference.
-                // The receiver syncs to our NTP server (started above).
-                // No client-side sync needed — our clock offset is zero.
-                self.timing_offset = Some(ClockOffset::default());
-                tracing::info!("NTP timing: sender is reference clock (offset=0)");
-            }
-            TimingProtocol::Ptp => {
-                match self.stream_config.ptp_mode {
-                    crate::airplay::core::PtpMode::Master => {
-                        // BMCA yield flow: act like a Mac sender
-                        // 1. Send 3 Syncs + Announces with Priority1=250
-                        // 2. HomePod wins BMCA (Priority1=248 < 250)
-                        // 3. We yield and become slave
-                        // 4. Receive Sync/Follow_Up from HomePod, calculate offset
-                        let (offset_tx, mut offset_rx) = watch::channel(ClockOffset::default());
-                        self.timing_tx = Some(offset_tx.clone());
-
-                        // Oneshot channel to receive HomePod's clock identity from BMCA
-                        let (clock_id_tx, clock_id_rx) = tokio::sync::oneshot::channel::<[u8; 8]>();
-
-                        let master_ip = addr;
-                        self.ptp_master_sync_task = Some(tokio::spawn(async move {
-                            if let Err(e) = run_bmca_yield_flow(
-                                master_ip,
-                                250,  // Priority1=250 (Mac's value, loses to HomePod's 248)
-                                offset_tx,
-                                clock_id_tx,
-                            ).await {
-                                tracing::error!("BMCA yield flow error: {}", e);
-                            }
-                        }));
-
-                        // Wait for BMCA to complete and get HomePod's clock identity
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            clock_id_rx,
-                        ).await {
-                            Ok(Ok(clock_id)) => {
-                                self.ptp_master_clock_id = Some(clock_id);
-                                tracing::info!("BMCA complete: HomePod clock ID = {:02x?}", clock_id);
-                            }
-                            Ok(Err(_)) => {
-                                tracing::warn!("BMCA: clock ID channel closed unexpectedly");
-                            }
-                            Err(_) => {
-                                tracing::warn!("BMCA: timeout waiting for clock ID (5s)");
-                            }
-                        }
-
-                        // Wait for first real clock offset from BMCA slave loop.
-                        // The slave loop needs a full Sync/Follow_Up/Delay_Req/Delay_Resp
-                        // exchange (~1-2s) before it can calculate the offset. A blind 500ms
-                        // sleep often reads zero, causing group sync packets to use wrong timestamps.
-                        match tokio::time::timeout(
-                            std::time::Duration::from_secs(5),
-                            offset_rx.changed(),
-                        ).await {
-                            Ok(Ok(())) => {
-                                tracing::info!("BMCA: First clock offset received from slave loop");
-                            }
-                            Ok(Err(_)) => {
-                                tracing::warn!("BMCA: offset channel closed before first offset");
-                            }
-                            Err(_) => {
-                                tracing::warn!("BMCA: Timeout waiting for first clock offset (5s), using zero");
-                            }
-                        }
-                        let initial_offset = *offset_rx.borrow_and_update();
-                        self.timing_offset = Some(initial_offset);
-
-                        tracing::info!("gPTP BMCA initialized (offset: {} ns, clock_id: {:02x?})",
-                            initial_offset.offset_ns, self.ptp_master_clock_id);
-                    }
-                    crate::airplay::core::PtpMode::Slave => {
-                        // Slave mode: Receiver (HomePod) is the timing master
-                        // We listen for Sync/Announce from receiver and calculate offset
-
-                        // Create watch channel for clock offset updates
-                        let (offset_tx, mut offset_rx) = watch::channel(ClockOffset::default());
-
-                        // Store the sender for the streamer to subscribe to
-                        self.timing_tx = Some(offset_tx.clone());
-
-                        // Spawn PTP slave task to listen for Sync/Follow-Up from HomePod
-                        tracing::info!("Starting PTP slave to sync with receiver at {}", addr);
-                        let ptp_task = tokio::spawn(async move {
-                            match run_ptp_slave(addr, offset_tx).await {
-                                Ok(()) => {
-                                    tracing::info!("PTP slave task completed");
-                                }
-                                Err(e) => {
-                                    tracing::error!("PTP slave task error: {}", e);
-                                }
-                            }
-                        });
-
-                        self.timing_task = Some(ptp_task);
-
-                        // Wait a moment for initial sync before proceeding
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-                        // Get the current offset from the channel
-                        let initial_offset = *offset_rx.borrow_and_update();
-                        self.timing_offset = Some(initial_offset);
-
-                        tracing::info!("PTP slave initialized (initial offset: {} ns)", initial_offset.offset_ns);
-                    }
-                }
-            }
-        }
+        // Timing sync - after stream is set up. This connection always uses
+        // NTP: the sender IS the timing reference, the receiver syncs to our
+        // NTP server (started above), and no client-side sync is needed —
+        // our clock offset is zero. (PTP timing existed here only to back
+        // multi-room/stereo-pair group streaming, removed from this project.)
+        self.timing_offset = Some(ClockOffset::default());
+        tracing::info!("NTP timing: sender is reference clock (offset=0)");
 
         tracing::info!("RTSP setup complete");
         Ok(())
@@ -1012,14 +866,6 @@ impl Connection {
         // Stop timing server
         if let Some(mut server) = self.timing_server.take() {
             server.stop().await;
-        }
-
-        // Stop PTP master sync task and master itself
-        if let Some(task) = self.ptp_master_sync_task.take() {
-            task.abort();
-        }
-        if let Some(mut master) = self.ptp_master.take() {
-            master.stop().await;
         }
 
         // Signal control thread to stop and wait for it to exit
@@ -1094,23 +940,16 @@ impl Connection {
         if self.render_delay_ms > 0 {
             streamer.set_render_delay_ms(self.render_delay_ms).await;
         }
-        // Use live watch channel for current offset (not stale setup-time value).
-        // The BMCA slave loop continuously updates the offset, so the watch channel
-        // has the latest value — much better than the snapshot from setup() time.
+        // timing_tx is only ever populated by group-streaming setup (removed
+        // from this project) — a solo NTP connection always takes the
+        // timing_offset branch below (offset stays zero, set in setup()).
         if let Some(ref tx) = self.timing_tx {
             let rx = tx.subscribe();
             let current_offset = *rx.borrow();
-            tracing::info!("Streaming: using live PTP offset = {} ns", current_offset.offset_ns);
             streamer.set_timing_offset(current_offset).await;
             streamer.set_timing_updates(rx).await;
         } else if let Some(offset) = self.timing_offset {
             streamer.set_timing_offset(offset).await;
-        }
-        // Enable PTP sync mode (PT=87) if we have a remote clock ID from BMCA
-        if self.stream_config.timing_protocol == TimingProtocol::Ptp {
-            if let Some(clock_id) = self.ptp_master_clock_id {
-                streamer.set_ptp_sync_mode(clock_id).await;
-            }
         }
 
         // Set up equalizer if configured
@@ -1283,13 +1122,12 @@ impl Connection {
         if self.render_delay_ms > 0 {
             streamer.set_render_delay_ms(self.render_delay_ms).await;
         }
-        // Use live watch channel for current offset (not stale setup-time value).
-        // The BMCA slave loop continuously updates the offset, so the watch channel
-        // has the latest value — much better than the snapshot from setup() time.
+        // timing_tx is only ever populated by group-streaming setup (removed
+        // from this project) — a solo NTP connection always takes the
+        // timing_offset branch below (offset stays zero, set in setup()).
         if let Some(ref tx) = self.timing_tx {
             let rx = tx.subscribe();
             let current_offset = *rx.borrow();
-            tracing::info!("Streaming: using live PTP offset = {} ns", current_offset.offset_ns);
             streamer.set_timing_offset(current_offset).await;
             streamer.set_timing_updates(rx).await;
         } else if let Some(offset) = self.timing_offset {
@@ -1565,283 +1403,6 @@ impl Connection {
         }
     }
 
-    /// Complete RTSP SETUP with PTP master mode for group streaming.
-    ///
-    /// This does the same RTSP setup as `setup()` but launches PTP as master
-    /// (priority1=246, wins against HomePod's 248) instead of BMCA yield flow
-    /// (priority1=250, loses to HomePod). All peer HomePods sync to our clock.
-    ///
-    /// `all_peer_ips` should include all HomePod IPs in the group (NOT our own IP).
-    pub async fn setup_as_ptp_master(&mut self, all_peer_ips: &[IpAddr]) -> Result<()> {
-        tracing::info!(
-            "RTSP setup start (PTP master mode, {} peers)",
-            all_peer_ips.len()
-        );
-
-        // SETUP Phase 1 (timing/event channels)
-        let local_timing_port = PTP_EVENT_PORT;
-        let local_addresses = self.rtsp.local_addr()
-            .map(|sa| vec![sa.ip().to_string()])
-            .unwrap_or_default();
-        let setup1_body = self.session.build_setup_phase1(local_timing_port, Some(local_addresses))?;
-        let setup1_req = RtspRequest::setup(self.session.request_uri(), setup1_body);
-        let setup1_resp = self.rtsp.send(setup1_req).await?;
-
-        if let Some(ref body) = setup1_resp.body {
-            tracing::debug!(
-                "SETUP phase 1 response: status={}, body_len={}",
-                setup1_resp.status_code, body.len()
-            );
-        }
-
-        self.session.process_setup_phase1_response(setup1_resp.body.as_deref().unwrap_or(&[]))?;
-
-        // Add RTSP Session header
-        let session_id = setup1_resp.headers.get("Session")
-            .cloned()
-            .unwrap_or_else(|| "1".to_string());
-        self.rtsp.add_session_header("Session", session_id);
-
-        // Establish events connection
-        let addr = *select_best_address(&self.device.addresses)
-            .ok_or_else(|| RtspError::ConnectionRefused)?;
-        let ports = self.session.ports()
-            .ok_or_else(|| CoreError::Rtsp(RtspError::InvalidResponse("No ports in SETUP response".into())))?;
-        let event_port = ports.event_port;
-
-        let events_addr = SocketAddr::new(addr, event_port);
-        tracing::info!("Establishing events connection to {}", events_addr);
-        match tokio::net::TcpStream::connect(events_addr).await {
-            Ok(stream) => {
-                tracing::info!("Events connection established");
-                self.events_stream = Some(stream);
-            }
-            Err(e) => {
-                warn!("Could not connect to events port {} (proceeding anyway): {}", events_addr, e);
-            }
-        }
-
-        // Bind control port
-        let mut control_receiver = RtpReceiver::new();
-        let actual_control_port = control_receiver.bind(0)?;
-        self.session.set_local_control_port(actual_control_port);
-        tracing::info!("Control port bound to {}", actual_control_port);
-        self.control_receiver = Some(Arc::new(control_receiver));
-
-        // SETUP Phase 2 (audio stream)
-        let setup2_body = self.session.build_setup_phase2()?;
-        let setup2_req = RtspRequest::setup(self.session.request_uri(), setup2_body);
-        let setup2_resp = self.rtsp.send(setup2_req).await?;
-        tracing::debug!(
-            "SETUP phase 2 response: status={}, body_len={}",
-            setup2_resp.status_code,
-            setup2_resp.body.as_ref().map(|b| b.len()).unwrap_or(0),
-        );
-        self.session.process_setup_phase2_response(setup2_resp.body.as_deref().unwrap_or(&[]))?;
-
-        // RECORD
-        let record_req = RtspRequest::record_with_info(
-            self.session.request_uri(),
-            0, 0,
-        );
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.rtsp.send(record_req)
-        ).await {
-            Ok(Ok(resp)) => {
-                if resp.status_code == 200 {
-                    tracing::info!("RECORD acknowledged");
-                } else {
-                    warn!("RECORD returned status {} (continuing)", resp.status_code);
-                }
-            }
-            Ok(Err(e)) => warn!("RECORD error (continuing): {}", e),
-            Err(_) => warn!("RECORD timeout (continuing)"),
-        }
-
-        // PTP master flow — we become grandmaster to all peers
-        let peer_ips_vec: Vec<IpAddr> = all_peer_ips.to_vec();
-        let (clock_id_tx, clock_id_rx) = tokio::sync::oneshot::channel::<[u8; 8]>();
-
-        // As PTP master, our offset is 0 (we ARE the reference clock)
-        let (offset_tx, _offset_rx) = watch::channel(ClockOffset::default());
-        self.timing_tx = Some(offset_tx);
-        self.timing_offset = Some(ClockOffset::default());
-
-        self.ptp_master_sync_task = Some(tokio::spawn(async move {
-            if let Err(e) = run_ptp_group_master_flow(
-                peer_ips_vec,
-                246,  // Priority1=246 — wins against HomePod's 248
-                clock_id_tx,
-            ).await {
-                tracing::error!("PTP group master flow error: {}", e);
-            }
-        }));
-
-        // Wait for BMCA to complete and get our clock identity
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            clock_id_rx,
-        ).await {
-            Ok(Ok(clock_id)) => {
-                self.ptp_master_clock_id = Some(clock_id);
-                tracing::info!("PTP master: our clock ID = {:02x?}", clock_id);
-            }
-            Ok(Err(_)) => {
-                tracing::warn!("PTP master: clock ID channel closed unexpectedly");
-            }
-            Err(_) => {
-                tracing::warn!("PTP master: timeout waiting for clock ID (8s)");
-            }
-        }
-
-        tracing::info!("PTP group master setup complete (offset=0, we are the clock)");
-        Ok(())
-    }
-
-    /// Send SETPEERS for multi-room (addresses of all group members).
-    pub async fn send_setpeers(&mut self, peer_addresses: &[String]) -> Result<()> {
-        let setpeers_body = self.session.build_setpeers(peer_addresses)?;
-        let setpeers_req = RtspRequest::setpeers(&self.session.id().to_string(), setpeers_body);
-        self.rtsp.send(setpeers_req).await?;
-        Ok(())
-    }
-
-    /// Complete RTSP SETUP for a secondary group member (no PTP).
-    ///
-    /// This does everything `setup()` does except PTP BMCA. Instead of running
-    /// BMCA on ports 319/320, it accepts the PTP clock state from the primary
-    /// connection. Only one connection per process can bind PTP ports.
-    ///
-    /// After setup, call `send_setpeers()` with all group member addresses.
-    pub async fn setup_for_group(
-        &mut self,
-        ptp_clock_id: [u8; 8],
-        timing_offset: ClockOffset,
-        timing_rx: watch::Receiver<ClockOffset>,
-    ) -> Result<()> {
-        tracing::info!(
-            "RTSP group setup start (stream_type={:?}, timing={:?})",
-            self.stream_config.stream_type,
-            self.stream_config.timing_protocol
-        );
-
-        // Use PTP_EVENT_PORT (319) — same as the primary. The PTP handler on port 319
-        // multiplexes multiple peers by source IP, so the secondary HomePod's PTP traffic
-        // is drained/logged but doesn't interfere with the primary's timing calculations.
-        let local_timing_port = PTP_EVENT_PORT;
-
-        // SETUP Phase 1 (timing/event channels)
-        let local_addresses = self.rtsp.local_addr()
-            .map(|sa| vec![sa.ip().to_string()])
-            .unwrap_or_default();
-        let setup1_body = self.session.build_setup_phase1(local_timing_port, Some(local_addresses))?;
-        tracing::debug!(
-            uri = %self.session.request_uri(),
-            body_len = setup1_body.len(),
-            "Sending SETUP phase 1 (group member)"
-        );
-        let setup1_req = RtspRequest::setup(self.session.request_uri(), setup1_body);
-        let setup1_resp = self.rtsp.send(setup1_req).await?;
-
-        if let Some(ref body) = setup1_resp.body {
-            tracing::debug!(
-                status = setup1_resp.status_code,
-                body_len = body.len(),
-                "SETUP phase 1 response received (group member)"
-            );
-        }
-
-        self.session.process_setup_phase1_response(setup1_resp.body.as_deref().unwrap_or(&[]))?;
-
-        // Add RTSP Session header
-        let session_id = setup1_resp.headers.get("Session")
-            .cloned()
-            .unwrap_or_else(|| "1".to_string());
-        self.rtsp.add_session_header("Session", session_id);
-
-        // Establish events connection
-        let addr = *select_best_address(&self.device.addresses)
-            .ok_or_else(|| RtspError::ConnectionRefused)?;
-        let ports = self.session.ports()
-            .ok_or_else(|| CoreError::Rtsp(RtspError::InvalidResponse("No ports in SETUP response".into())))?;
-        let event_port = ports.event_port;
-
-        let events_addr = SocketAddr::new(addr, event_port);
-        tracing::info!("Establishing events connection to {} (group member)", events_addr);
-        match TcpStream::connect(events_addr).await {
-            Ok(stream) => {
-                tracing::info!("Events connection established (group member)");
-                self.events_stream = Some(stream);
-            }
-            Err(e) => {
-                warn!("Could not connect to events port {} (proceeding anyway): {}", events_addr, e);
-            }
-        }
-
-        // Bind control port
-        let mut control_receiver = RtpReceiver::new();
-        let actual_control_port = control_receiver.bind(0)?;
-        self.session.set_local_control_port(actual_control_port);
-        tracing::info!("Control port bound to {} (group member)", actual_control_port);
-        self.control_receiver = Some(Arc::new(control_receiver));
-
-        // SETUP Phase 2 (audio stream — gets device-specific shk)
-        let setup2_body = self.session.build_setup_phase2()?;
-        let setup2_req = RtspRequest::setup(self.session.request_uri(), setup2_body);
-        let setup2_resp = self.rtsp.send(setup2_req).await?;
-        tracing::debug!(
-            "SETUP phase 2 response (group member): status={}, body_len={}",
-            setup2_resp.status_code,
-            setup2_resp.body.as_ref().map(|b| b.len()).unwrap_or(0),
-        );
-        self.session.process_setup_phase2_response(setup2_resp.body.as_deref().unwrap_or(&[]))?;
-
-        // RECORD
-        tracing::debug!("Sending RECORD request (group member)");
-        let record_req = RtspRequest::record_with_info(
-            self.session.request_uri(),
-            0,
-            0,
-        );
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.rtsp.send(record_req)
-        ).await {
-            Ok(Ok(resp)) => {
-                if resp.status_code == 200 {
-                    tracing::info!("RECORD acknowledged (group member)");
-                } else {
-                    warn!("RECORD returned status {} (group member, continuing)", resp.status_code);
-                }
-            }
-            Ok(Err(e)) => warn!("RECORD error (group member, continuing): {}", e),
-            Err(_) => warn!("RECORD timeout (group member, continuing)"),
-        }
-
-        // Inject PTP state from primary connection (no BMCA)
-        self.ptp_master_clock_id = Some(ptp_clock_id);
-        self.timing_offset = Some(timing_offset);
-        // Store a new sender that mirrors the primary's offset updates
-        let (local_tx, _) = watch::channel(timing_offset);
-        self.timing_tx = Some(local_tx);
-        // Spawn a task that forwards offset updates from the primary's channel
-        let local_tx_clone = self.timing_tx.as_ref().unwrap().clone();
-        let mut rx = timing_rx;
-        self.timing_task = Some(tokio::spawn(async move {
-            while rx.changed().await.is_ok() {
-                let offset = *rx.borrow();
-                let _ = local_tx_clone.send(offset);
-            }
-        }));
-
-        tracing::info!(
-            "Group member RTSP setup complete (clock_id={:02x?}, offset={} ns)",
-            ptp_clock_id, timing_offset.offset_ns
-        );
-        Ok(())
-    }
-
     /// Send FLUSH to clear receiver buffers before streaming.
     ///
     /// This tells the receiver to discard any buffered audio and expect
@@ -1953,11 +1514,6 @@ impl Connection {
             cipher,
             control_socket,
         })
-    }
-
-    /// Get the PTP master clock ID from BMCA yield (if available).
-    pub fn ptp_master_clock_id(&self) -> Option<[u8; 8]> {
-        self.ptp_master_clock_id
     }
 
     /// Get the current timing offset (if available).
@@ -2447,16 +2003,6 @@ mod tests {
             // - Start NtpTimingServer on ephemeral port
             // - Send port to receiver in SETUP phase 1
             // - Receiver sends timing requests to our server
-            // - Sender is the timing reference (offset = 0)
-            assert!(true);
-        }
-
-        #[test]
-        fn ptp_starts_timing_master() {
-            // When timing_protocol = PTP:
-            // - Start PtpMaster on ports 319/320
-            // - Spawn background task sending Sync every 200ms
-            // - Send Announce every 1 second
             // - Sender is the timing reference (offset = 0)
             assert!(true);
         }
