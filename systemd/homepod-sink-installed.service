@@ -7,7 +7,7 @@ Wants=pipewire.service pipewire-session-manager.service
 [Service]
 Type=simple
 EnvironmentFile=-%h/.config/homepod-sink/homepod-sink.env
-ExecStart=%h/src/homepod-sink/systemd/run.sh
+ExecStart=/usr/lib/homepod-sink/run.sh
 Restart=on-failure
 RestartSec=5
 

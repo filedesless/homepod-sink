@@ -4,9 +4,17 @@
 # thread can preempt a sender thread sharing the same process unpredictably.
 set -euo pipefail
 
+# Prefer a sibling target/release build (repo checkout, dev workflow) over
+# the packaged install location (/usr/lib/homepod-sink - not on PATH, since
+# "capture" is too generic a name to put there) if both exist.
 BIN_DIR="$(dirname "$(readlink -f "$0")")/.."
-CAPTURE="$BIN_DIR/target/release/capture"
-SINK="$BIN_DIR/target/release/homepod-sink"
+if [ -x "$BIN_DIR/target/release/capture" ]; then
+    CAPTURE="$BIN_DIR/target/release/capture"
+    SINK="$BIN_DIR/target/release/homepod-sink"
+else
+    CAPTURE="/usr/lib/homepod-sink/capture"
+    SINK="/usr/lib/homepod-sink/homepod-sink"
+fi
 
 : "${HOMEPOD_IP:=}"
 : "${HOMEPOD_NAME:=}"

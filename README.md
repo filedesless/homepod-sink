@@ -36,6 +36,23 @@ is healthy, independent of everything else.
 
 ## Installation
 
+### Arch Linux
+
+A `PKGBUILD` is included, building straight from this repo (`homepod-sink-git`):
+
+```sh
+makepkg -si
+```
+
+This builds and installs the three binaries to `/usr/lib/homepod-sink/`
+(deliberately not on `PATH` — `capture` is too generic a name for that), plus
+a systemd user unit at `/usr/lib/systemd/user/homepod-sink.service` and an
+env file template at `/etc/homepod-sink/homepod-sink.env.example`. See
+[Running as a systemd service](#running-as-a-systemd-service) below to
+enable it. Uninstall with `sudo pacman -R homepod-sink-git`.
+
+### From source
+
 Requires:
 - Rust (stable toolchain)
 - PipeWire (with a running user session — this is what most modern Linux
@@ -111,8 +128,19 @@ those constants for your device before building.
 
 ## Running as a systemd service
 
-The `systemd/` directory has everything needed to run this as a persistent
-user service that starts with your session:
+**If installed via the Arch package**, the unit is already at
+`/usr/lib/systemd/user/homepod-sink.service`:
+
+```sh
+mkdir -p ~/.config/homepod-sink
+cp /etc/homepod-sink/homepod-sink.env.example ~/.config/homepod-sink/homepod-sink.env
+# edit ~/.config/homepod-sink/homepod-sink.env: set HOMEPOD_IP (or HOMEPOD_NAME)
+systemctl --user daemon-reload
+systemctl --user enable --now homepod-sink
+```
+
+**If built from source**, the `systemd/` directory has everything needed to
+run this as a persistent user service that starts with your session:
 
 ```sh
 mkdir -p ~/.config/systemd/user ~/.config/homepod-sink
