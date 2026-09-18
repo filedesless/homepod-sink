@@ -507,10 +507,6 @@ struct StreamerInner {
     /// Tells the receiver to render audio this far in the future, giving more
     /// time for retransmit recovery of lost packets.
     render_delay_ns: u64,
-    /// Whether to use PTP-mode sync packets (PT=87) instead of NTP (PT=84).
-    use_ptp_sync: bool,
-    /// PTP master clock identity (from BMCA, used in PT=87 packets).
-    ptp_master_clock_id: [u8; 8],
 }
 
 /// High-level audio streamer.
@@ -576,8 +572,6 @@ impl AudioStreamer {
                 spatial_snapshot: None,
                 first_packet_sent: false,
                 render_delay_ns: 0,
-                use_ptp_sync: false,
-                ptp_master_clock_id: [0u8; 8],
             })),
             task: None,
             state_cache: Arc::new(AtomicU8::new(StreamerState::Idle as u8)),
@@ -602,17 +596,6 @@ impl AudioStreamer {
     /// All senders share the same RTP sequence/timestamp space.
     pub async fn set_rtp_senders(&mut self, senders: Vec<RtpSender>) {
         self.inner.lock().await.rtp_senders = senders;
-    }
-
-    /// Enable PTP-mode sync packets (PT=87) instead of NTP sync (PT=84).
-    ///
-    /// When enabled, sync packets include PTP clock timestamps and the master
-    /// clock identity instead of NTP epoch timestamps.
-    pub async fn set_ptp_sync_mode(&mut self, clock_id: [u8; 8]) {
-        let mut inner = self.inner.lock().await;
-        inner.use_ptp_sync = true;
-        inner.ptp_master_clock_id = clock_id;
-        tracing::info!("PTP sync mode enabled, master clock ID: {:02x?}", clock_id);
     }
 
     /// Set render delay in milliseconds.
@@ -1387,19 +1370,11 @@ async fn run_streamer(
                 let need_sync = first_packet || last_sync_rtp == 0
                     || rtp_ts.wrapping_sub(last_sync_rtp) >= sample_rate;
 
-                let use_ptp_sync = guard.use_ptp_sync;
-                let ptp_clock_id = guard.ptp_master_clock_id;
-
                 if !guard.rtp_senders.is_empty() {
                     if let Some(ref tx) = sender_tx {
                         // Sender thread path
                         let sync_data = if need_sync {
-                            if use_ptp_sync {
-                                let next_rtp_ts = rtp_ts.wrapping_add(sample_rate / 44100 * 352);
-                                guard.rtp_senders[0].prepare_ptp_sync(rtp_ts, render_adjusted, next_rtp_ts, &ptp_clock_id)?
-                            } else {
-                                guard.rtp_senders[0].prepare_sync(rtp_ts, ntp)?
-                            }
+                            guard.rtp_senders[0].prepare_sync(rtp_ts, ntp)?
                         } else {
                             None
                         };
@@ -1481,12 +1456,7 @@ async fn run_streamer(
                         // Fallback: direct send (no sender thread)
                         // Send sync from first sender, audio from all senders
                         if need_sync {
-                            if use_ptp_sync {
-                                let next_rtp_ts = rtp_ts.wrapping_add(sample_rate / 44100 * 352);
-                                guard.rtp_senders[0].send_ptp_sync(rtp_ts, render_adjusted, next_rtp_ts, &ptp_clock_id)?;
-                            } else {
-                                guard.rtp_senders[0].send_sync(rtp_ts, ntp)?;
-                            }
+                            guard.rtp_senders[0].send_sync(rtp_ts, ntp)?;
                         }
 
                         let send_start = Instant::now();
