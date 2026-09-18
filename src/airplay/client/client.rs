@@ -1,0 +1,690 @@
+//! Main AirPlay client API.
+
+use crate::airplay::core::{Device, DeviceId, StreamConfig, error::Result};
+use crate::airplay::core::error::{Error, RtspError};
+use crate::airplay::discovery::{ServiceBrowser, Discovery};
+use crate::airplay::audio::{AudioDecoder, LiveAudioDecoder, LiveFrameSender, EqConfig, EqParams, SpatialParams, SpeakerConfig};
+use std::sync::Arc;
+use std::path::Path;
+use std::time::Duration;
+use super::{Connection, PlaybackState, EventHandler, ClientEvent};
+
+/// High-level AirPlay 2 sender client.
+pub struct AirPlayClient {
+    browser: ServiceBrowser,
+    connection: Option<Connection>,
+    event_handler: Option<Box<dyn EventHandler>>,
+    stream_config: StreamConfig,
+    /// Render delay in ms added to NTP timestamps for extra retransmit headroom.
+    /// Default: 200ms for reliable playback over WiFi.
+    render_delay_ms: u32,
+    /// Stream statistics (shared across all streaming threads).
+    stream_stats: Arc<super::stats::StreamStats>,
+}
+
+impl AirPlayClient {
+    /// Create new client.
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            browser: ServiceBrowser::new()?,
+            connection: None,
+            event_handler: None,
+            stream_config: StreamConfig::default(),
+            render_delay_ms: 200, // 200ms default for reliable playback over WiFi
+            stream_stats: super::stats::StreamStats::new(),
+        })
+    }
+
+    /// Create client with specific configuration.
+    pub fn with_config(config: StreamConfig, event_handler: Option<Box<dyn EventHandler>>) -> Result<Self> {
+        Ok(Self {
+            browser: ServiceBrowser::new()?,
+            connection: None,
+            event_handler,
+            stream_config: config,
+            render_delay_ms: 200, // 200ms default for reliable playback over WiFi
+            stream_stats: super::stats::StreamStats::new(),
+        })
+    }
+
+    /// Set event handler.
+    pub fn set_event_handler(&mut self, handler: impl EventHandler + 'static) {
+        self.event_handler = Some(Box::new(handler));
+    }
+
+    /// Set render delay in milliseconds.
+    ///
+    /// Shifts NTP timestamps in sync packets into the future, telling the
+    /// receiver to buffer audio longer before rendering. This gives more
+    /// headroom for retransmit recovery of lost packets over lossy WiFi.
+    ///
+    /// Default is 200ms. Typical values: 100-500ms.
+    /// Must be called before `connect()`.
+    pub fn set_render_delay_ms(&mut self, delay_ms: u32) {
+        self.render_delay_ms = delay_ms;
+    }
+
+    /// Emit an event if handler is set.
+    async fn emit_event(&self, event: ClientEvent) {
+        if let Some(ref handler) = self.event_handler {
+            handler.on_event(event).await;
+        }
+    }
+
+    /// Discover AirPlay devices on the network.
+    pub async fn discover(&self, timeout: Duration) -> Result<Vec<Device>> {
+        self.browser.scan(timeout).await
+    }
+
+    /// Get a specific device by ID.
+    pub async fn get_device(&self, id: &DeviceId) -> Option<Device> {
+        self.browser.get_device(id).await
+    }
+
+    /// Connect to a device.
+    pub async fn connect(&mut self, device: &Device) -> Result<()> {
+        // Disconnect existing connection if any
+        if self.connection.is_some() {
+            self.disconnect().await?;
+        }
+
+        // Use the user-provided stream config (don't override based on device features)
+        let stream_config = self.stream_config.clone();
+
+        // Establish connection
+        let mut connection = Connection::connect(device.clone(), stream_config).await?;
+
+        // Set render delay for retransmit headroom
+        connection.set_render_delay_ms(self.render_delay_ms);
+
+        // Complete RTSP SETUP handshake (CRITICAL - required before streaming)
+        connection.setup().await?;
+
+        self.connection = Some(connection);
+
+        self.emit_event(ClientEvent::Connected(device.clone())).await;
+
+        Ok(())
+    }
+
+    /// Connect to a device with PIN (for password-protected devices).
+    pub async fn connect_with_pin(&mut self, device: &Device, pin: &str) -> Result<()> {
+        // Disconnect existing connection if any
+        if self.connection.is_some() {
+            self.disconnect().await?;
+        }
+
+        // Use the user-provided stream config (don't override based on device features)
+        let stream_config = self.stream_config.clone();
+
+        // Establish connection
+        let mut connection = Connection::connect_with_pin(device.clone(), stream_config, pin).await?;
+
+        // Set render delay for retransmit headroom
+        connection.set_render_delay_ms(self.render_delay_ms);
+
+        // Complete RTSP SETUP handshake (CRITICAL - required before streaming)
+        connection.setup().await?;
+
+        self.connection = Some(connection);
+
+        self.emit_event(ClientEvent::Connected(device.clone())).await;
+
+        Ok(())
+    }
+
+    /// Disconnect from current device.
+    pub async fn disconnect(&mut self) -> Result<()> {
+        if let Some(ref mut connection) = self.connection {
+            connection.disconnect().await?;
+        }
+        self.connection = None;
+
+        self.emit_event(ClientEvent::Disconnected(None)).await;
+
+        Ok(())
+    }
+
+    /// Check if connected.
+    pub fn is_connected(&self) -> bool {
+        self.connection.is_some()
+    }
+
+    /// Get connected device.
+    pub fn connected_device(&self) -> Option<&Device> {
+        self.connection.as_ref().map(|c| c.device())
+    }
+
+    /// Play audio from file.
+    pub async fn play_file(&mut self, path: impl AsRef<Path>) -> Result<()> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+
+        // Create decoder for the file
+        let decoder = AudioDecoder::open(path)?;
+
+        // Start streaming
+        connection.start_streaming(decoder).await?;
+
+        self.emit_event(ClientEvent::PlaybackStateChanged(PlaybackState::Playing)).await;
+
+        Ok(())
+    }
+
+    /// Play audio from raw PCM samples (one-shot).
+    pub async fn play_pcm(&mut self, _samples: &[i16], _sample_rate: u32, _channels: u8) -> Result<()> {
+        let _connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+
+        // TODO: One-shot PCM streaming path not implemented yet
+        // For streaming, use start_live_streaming() instead
+        Err(Error::Streaming(crate::airplay::core::error::StreamingError::InvalidFormat(
+            "One-shot PCM streaming not implemented. Use start_live_streaming() for live sources.".into(),
+        )))
+    }
+
+    /// Start live audio streaming from an external source (e.g., Bluetooth).
+    ///
+    /// Returns a `LiveFrameSender` that can be used to push PCM frames to the
+    /// AirPlay stream. The stream will continue until stopped or the sender is dropped.
+    ///
+    /// # Arguments
+    /// * `sample_rate` - Sample rate of the source audio in Hz (e.g., 44100)
+    /// * `channels` - Number of audio channels (typically 2 for stereo)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let sender = client.start_live_streaming(44100, 2).await?;
+    ///
+    /// // Push frames in a loop
+    /// loop {
+    ///     let frame = LivePcmFrame {
+    ///         samples: captured_audio,
+    ///         channels: 2,
+    ///         sample_rate: 44100,
+    ///     };
+    ///     sender.try_send(frame);
+    /// }
+    /// ```
+    pub async fn start_live_streaming(&mut self, sample_rate: u32, channels: u8) -> Result<LiveFrameSender> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+
+        // Create live decoder and sender pair
+        // Capacity of 16 frames provides ~350ms buffer at 352 frames/packet, 44.1kHz
+        let (sender, decoder) = LiveAudioDecoder::create_pair(sample_rate, channels, 16);
+
+        // Start live streaming
+        connection.start_streaming_live(decoder).await?;
+
+        self.emit_event(ClientEvent::PlaybackStateChanged(PlaybackState::Playing)).await;
+
+        Ok(sender)
+    }
+
+    /// Start live audio streaming with an existing decoder.
+    ///
+    /// This allows the caller to create the sender/decoder pair first, pre-fill
+    /// the channel with audio data, and then start streaming. This avoids startup
+    /// artifacts from empty buffers.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Create sender/decoder pair with larger buffer
+    /// let (sender, decoder) = LiveAudioDecoder::create_pair(44100, 2, 64);
+    ///
+    /// // Start capture thread that sends frames to sender
+    /// std::thread::spawn(move || {
+    ///     loop { sender.try_send(frame); }
+    /// });
+    ///
+    /// // Wait for channel to fill
+    /// std::thread::sleep(Duration::from_millis(500));
+    ///
+    /// // Now start streaming with pre-filled decoder
+    /// client.start_live_streaming_with_decoder(decoder).await?;
+    /// ```
+    pub async fn start_live_streaming_with_decoder(&mut self, decoder: LiveAudioDecoder) -> Result<()> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+
+        // Start live streaming with the provided decoder
+        connection.start_streaming_live(decoder).await?;
+
+        self.emit_event(ClientEvent::PlaybackStateChanged(PlaybackState::Playing)).await;
+
+        Ok(())
+    }
+
+    /// Pause playback.
+    pub async fn pause(&mut self) -> Result<()> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+
+        connection.pause().await?;
+
+        self.emit_event(ClientEvent::PlaybackStateChanged(PlaybackState::Paused)).await;
+
+        Ok(())
+    }
+
+    /// Resume playback.
+    pub async fn resume(&mut self) -> Result<()> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+
+        connection.resume().await?;
+
+        self.emit_event(ClientEvent::PlaybackStateChanged(PlaybackState::Playing)).await;
+
+        Ok(())
+    }
+
+    /// Stop playback.
+    pub async fn stop(&mut self) -> Result<()> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+
+        connection.stop().await?;
+
+        self.emit_event(ClientEvent::PlaybackStateChanged(PlaybackState::Stopped)).await;
+
+        Ok(())
+    }
+
+    /// Seek to position in seconds.
+    pub async fn seek(&mut self, position_secs: f64) -> Result<()> {
+        let _connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+
+        // Seeking requires buffer manipulation and timestamp coordination
+        // For now, this is a stub - full implementation would need:
+        // 1. Flush current buffer
+        // 2. Seek decoder to position
+        // 3. Refill buffer
+        // 4. Resume playback
+
+        self.emit_event(ClientEvent::PositionUpdated(position_secs)).await;
+
+        Ok(())
+    }
+
+    /// Set volume (0.0 to 1.0).
+    pub async fn set_volume(&mut self, volume: f32) -> Result<()> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+
+        connection.set_volume(volume).await?;
+
+        self.emit_event(ClientEvent::VolumeChanged(volume)).await;
+
+        Ok(())
+    }
+
+    /// Send feedback/keepalive to the receiver.
+    ///
+    /// **IMPORTANT:** AirPlay 2 receivers expect periodic feedback requests (~every 2 seconds)
+    /// during active playback. Call this from your main loop to maintain the session and prevent
+    /// timeouts.
+    ///
+    /// # Example
+    /// ```ignore
+    /// // In your playback loop:
+    /// loop {
+    ///     tokio::time::sleep(Duration::from_secs(2)).await;
+    ///     if let Err(e) = client.send_feedback().await {
+    ///         eprintln!("Feedback failed: {}", e);
+    ///     }
+    /// }
+    /// ```
+    pub async fn send_feedback(&mut self) -> Result<()> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+
+        connection.send_feedback().await?;
+
+        Ok(())
+    }
+
+    /// Set up the equalizer with shared parameters.
+    ///
+    /// The EQ will be applied to audio during streaming. Parameters can be
+    /// updated atomically from another thread (e.g., the UI).
+    ///
+    /// Must be called after `connect()` and before `play_file()` or `start_live_streaming()`.
+    ///
+    /// # Example
+    /// ```ignore
+    /// let config = EqConfig::five_band();
+    /// let params = Arc::new(EqParams::new(config.num_bands()));
+    ///
+    /// // Set bass boost
+    /// params.set_gain_db(0, 6.0);
+    ///
+    /// client.set_eq_params(config, params.clone()).await?;
+    /// client.play_file("song.mp3").await?;
+    ///
+    /// // Adjust EQ during playback
+    /// params.set_gain_db(4, -3.0);  // Reduce treble
+    /// ```
+    pub fn set_eq_params(&mut self, config: EqConfig, params: Arc<EqParams>) -> Result<()> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+
+        connection.set_eq_params(config, params);
+        Ok(())
+    }
+
+    /// Get a clone of the EQ params Arc if set.
+    pub fn eq_params(&self) -> Option<Arc<EqParams>> {
+        self.connection.as_ref().and_then(|c| c.eq_params())
+    }
+
+    /// Set up spatial audio processing with shared parameters.
+    ///
+    /// When enabled, each speaker in the group receives a unique audio mix
+    /// based on its position relative to the listener. Parameters can be
+    /// updated atomically from another thread (e.g., the TUI).
+    ///
+    /// Must be called after `connect()`.
+    pub fn set_spatial_params(&mut self, params: Arc<SpatialParams>, speakers: Vec<SpeakerConfig>) -> Result<()> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+
+        connection.set_spatial_params(params, speakers);
+        Ok(())
+    }
+
+    /// Get a clone of the spatial params Arc if set.
+    pub fn spatial_params(&self) -> Option<Arc<SpatialParams>> {
+        self.connection.as_ref().and_then(|c| c.spatial_params())
+    }
+
+    /// Get current playback state.
+    pub fn playback_state(&self) -> PlaybackState {
+        self.connection
+            .as_ref()
+            .map(|c| c.playback_state())
+            .unwrap_or(PlaybackState::Stopped)
+    }
+
+    /// Get current playback position in seconds.
+    pub fn playback_position(&self) -> f64 {
+        self.connection
+            .as_ref()
+            .map(|c| c.playback_position())
+            .unwrap_or(0.0)
+    }
+
+    /// Wait for playback to complete.
+    pub async fn wait_for_completion(&self) -> Result<()> {
+        // Poll playback state until stopped
+        loop {
+            let state = self.playback_state();
+            match state {
+                PlaybackState::Stopped | PlaybackState::Error => break,
+                _ => {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+
+    /// Get the shared stream stats.
+    pub fn stream_stats(&self) -> Arc<super::stats::StreamStats> {
+        Arc::clone(&self.stream_stats)
+    }
+
+    /// Get a snapshot of current stream statistics.
+    pub fn stats_snapshot(&self) -> super::stats::StatsSnapshot {
+        if let Some(ref conn) = self.connection {
+            let mut snap = conn.stream_stats().snapshot();
+            snap.packets_sent = conn.streamer_packets_sent();
+            snap.underruns = conn.streamer_underruns();
+            snap
+        } else {
+            super::stats::StatsSnapshot::default()
+        }
+    }
+}
+
+impl Default for AirPlayClient {
+    fn default() -> Self {
+        Self::new().expect("Failed to create client")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    mod client_creation {
+        use super::*;
+
+        #[test]
+        fn new_creates_disconnected_client() {
+            // Skip if mDNS not available
+            if let Ok(client) = AirPlayClient::new() {
+                assert!(!client.is_connected());
+                assert!(client.connected_device().is_none());
+                assert_eq!(client.playback_state(), PlaybackState::Stopped);
+            }
+        }
+
+        #[test]
+        fn default_creates_client() {
+            // Skip if mDNS not available
+            // Note: Default panics if creation fails, so we use new() for testing
+            if let Ok(client) = AirPlayClient::new() {
+                assert!(!client.is_connected());
+            }
+        }
+    }
+
+    mod discovery {
+        use super::*;
+
+        #[tokio::test]
+        async fn discover_returns_devices() {
+            // Skip if mDNS not available
+            if let Ok(client) = AirPlayClient::new() {
+                // Very short timeout - we don't expect to find devices in tests
+                let devices = client.discover(Duration::from_millis(100)).await;
+                assert!(devices.is_ok());
+            }
+        }
+
+        #[tokio::test]
+        async fn discover_respects_timeout() {
+            if let Ok(client) = AirPlayClient::new() {
+                let start = std::time::Instant::now();
+                let _ = client.discover(Duration::from_millis(200)).await;
+                let elapsed = start.elapsed();
+                // Should complete within a reasonable time of the timeout
+                assert!(elapsed >= Duration::from_millis(200));
+                assert!(elapsed < Duration::from_secs(2));
+            }
+        }
+
+        #[tokio::test]
+        async fn get_device_returns_none_for_unknown() {
+            if let Ok(client) = AirPlayClient::new() {
+                let unknown_id = DeviceId([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00]);
+                let result = client.get_device(&unknown_id).await;
+                assert!(result.is_none());
+            }
+        }
+    }
+
+    mod connection {
+        use super::*;
+
+        #[tokio::test]
+        async fn connect_establishes_connection() {
+            // This test requires a real device - skip in unit tests
+        }
+
+        #[tokio::test]
+        async fn connect_with_pin_for_protected_device() {
+            // This test requires a real device - skip in unit tests
+        }
+
+        #[tokio::test]
+        async fn disconnect_clears_connection() {
+            if let Ok(mut client) = AirPlayClient::new() {
+                // Even without being connected, disconnect should succeed
+                let result = client.disconnect().await;
+                assert!(result.is_ok());
+                assert!(!client.is_connected());
+            }
+        }
+
+        #[tokio::test]
+        async fn is_connected_reflects_state() {
+            if let Ok(client) = AirPlayClient::new() {
+                assert!(!client.is_connected());
+            }
+        }
+
+        #[tokio::test]
+        async fn connected_device_returns_device() {
+            if let Ok(client) = AirPlayClient::new() {
+                // Not connected, should return None
+                assert!(client.connected_device().is_none());
+            }
+        }
+    }
+
+    mod playback {
+        use super::*;
+
+        #[tokio::test]
+        async fn play_file_starts_playback() {
+            // This test requires a real device - skip in unit tests
+        }
+
+        #[tokio::test]
+        async fn play_file_error_when_disconnected() {
+            if let Ok(mut client) = AirPlayClient::new() {
+                let result = client.play_file("/nonexistent.mp3").await;
+                // Should fail because we're not connected
+                assert!(result.is_err());
+            }
+        }
+
+        #[tokio::test]
+        async fn pause_pauses_playback() {
+            if let Ok(mut client) = AirPlayClient::new() {
+                // Should fail when not connected
+                let result = client.pause().await;
+                assert!(result.is_err());
+            }
+        }
+
+        #[tokio::test]
+        async fn resume_resumes_playback() {
+            if let Ok(mut client) = AirPlayClient::new() {
+                // Should fail when not connected
+                let result = client.resume().await;
+                assert!(result.is_err());
+            }
+        }
+
+        #[tokio::test]
+        async fn stop_stops_playback() {
+            if let Ok(mut client) = AirPlayClient::new() {
+                // Should fail when not connected
+                let result = client.stop().await;
+                assert!(result.is_err());
+            }
+        }
+
+        #[tokio::test]
+        async fn seek_changes_position() {
+            if let Ok(mut client) = AirPlayClient::new() {
+                // Should fail when not connected
+                let result = client.seek(10.0).await;
+                assert!(result.is_err());
+            }
+        }
+
+        #[tokio::test]
+        async fn set_volume_in_range() {
+            if let Ok(mut client) = AirPlayClient::new() {
+                // Should fail when not connected
+                let result = client.set_volume(0.5).await;
+                assert!(result.is_err());
+            }
+        }
+
+        #[tokio::test]
+        async fn playback_state_reflects_current_state() {
+            if let Ok(client) = AirPlayClient::new() {
+                assert_eq!(client.playback_state(), PlaybackState::Stopped);
+            }
+        }
+
+        #[tokio::test]
+        async fn playback_position_tracks_progress() {
+            if let Ok(client) = AirPlayClient::new() {
+                assert_eq!(client.playback_position(), 0.0);
+            }
+        }
+
+        #[tokio::test]
+        async fn wait_for_completion_blocks() {
+            // This test would block forever without actual playback
+            // Skip in unit tests
+        }
+    }
+
+    mod events {
+        use super::*;
+
+        #[tokio::test]
+        async fn event_handler_called_on_connect() {
+            // This test requires real devices - skip in unit tests
+        }
+
+        #[tokio::test]
+        async fn event_handler_called_on_disconnect() {
+            // We can test this without a device
+            use std::sync::atomic::{AtomicBool, Ordering};
+            use std::sync::Arc;
+            use crate::airplay::client::events::CallbackHandler;
+
+            let event_received = Arc::new(AtomicBool::new(false));
+            let event_received_clone = Arc::clone(&event_received);
+
+            if let Ok(mut client) = AirPlayClient::new() {
+                client.set_event_handler(CallbackHandler::new(move |event| {
+                    if matches!(event, ClientEvent::Disconnected(_)) {
+                        event_received_clone.store(true, Ordering::SeqCst);
+                    }
+                }));
+
+                client.disconnect().await.unwrap();
+                assert!(event_received.load(Ordering::SeqCst));
+            }
+        }
+
+        #[tokio::test]
+        async fn event_handler_called_on_playback_change() {
+            // This test requires real devices - skip in unit tests
+        }
+    }
+}

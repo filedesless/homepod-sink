@@ -4,7 +4,11 @@ Turns a HomePod (or other AirPlay 2 speaker) into a PipeWire audio output on
 Linux. Captures system audio via a virtual PipeWire sink and streams it over
 AirPlay 2 in real time.
 
-Built on a local fork of [airplay2-rs](https://github.com/filedesless/airplay2-rs).
+The AirPlay 2 protocol implementation (`src/airplay/`) started as a trimmed
+vendor of [airplay2-rs](https://github.com/filedesless/airplay2-rs) — cut down
+to just the HomeKit-paired, NTP-timed, single-device, live-streaming path this
+project actually uses (no RAOP/AirPlay 1, no PTP, no Bluetooth, no TUI) — and
+now lives in this repo as ordinary source, not an external dependency.
 
 ## How it works
 
@@ -36,13 +40,11 @@ Requires:
 - Rust (stable toolchain)
 - PipeWire (with a running user session — this is what most modern Linux
   desktops use by default)
-- A checkout of [airplay2-rs](https://github.com/filedesless/airplay2-rs) as
-  a sibling directory (`../airplay2-rs` relative to this repo, or adjust the
-  `path = "..."` entries in `Cargo.toml`) — the AirPlay client crates are
-  consumed as local path dependencies, not from crates.io.
+
+Everything else is an ordinary crates.io dependency — no sibling checkout or
+path dependency needed.
 
 ```sh
-git clone https://github.com/filedesless/airplay2-rs ../airplay2-rs
 cargo build --release
 ```
 

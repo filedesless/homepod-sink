@@ -7,12 +7,12 @@
 //!
 //! Usage: play <path-to-audio-file> [volume 0.0-1.0, default 1.0]
 
-use airplay_audio::{AlacEncoder, AudioDecoder};
-use airplay_client::Connection;
-use airplay_core::device::{Device, DeviceId};
-use airplay_core::features::Features;
-use airplay_core::stream::{PtpMode, StreamType, TimingProtocol};
-use airplay_core::{AudioCodec, AudioFormat, StreamConfig};
+use homepod_sink::airplay::audio::{AlacEncoder, AudioDecoder};
+use homepod_sink::airplay::client::Connection;
+use homepod_sink::airplay::core::device::{Device, DeviceId};
+use homepod_sink::airplay::core::features::Features;
+use homepod_sink::airplay::core::stream::{PtpMode, StreamType, TimingProtocol};
+use homepod_sink::airplay::core::{AudioFormat, StreamConfig};
 use std::net::IpAddr;
 use std::time::Duration;
 

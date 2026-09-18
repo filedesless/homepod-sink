@@ -4,10 +4,10 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use airplay_audio::{AlacEncoder, LiveAudioDecoder, LivePcmFrame};
-use airplay_client::AirPlayClient;
-use airplay_core::device::DeviceId;
-use airplay_core::{AudioCodec, StreamConfig};
+use homepod_sink::airplay::audio::{AlacEncoder, LiveAudioDecoder, LivePcmFrame};
+use homepod_sink::airplay::client::AirPlayClient;
+use homepod_sink::airplay::core::device::DeviceId;
+use homepod_sink::airplay::core::{AudioCodec, StreamConfig};
 
 /// Read raw interleaved i16 PCM from stdin (as produced by `capture`) and
 /// stream it to a HomePod / AirPlay speaker.
@@ -173,9 +173,9 @@ async fn connect_airplay(args: &Args, decoder: LiveAudioDecoder) -> Result<()> {
 /// ambiguity is reported (listing every candidate's name/model/IP) rather
 /// than guessed at, since this also runs unattended under systemd.
 fn select_discovered_device(
-    devices: Vec<airplay_core::device::Device>,
+    devices: Vec<homepod_sink::airplay::core::device::Device>,
     name_filter: Option<&str>,
-) -> Result<airplay_core::device::Device> {
+) -> Result<homepod_sink::airplay::core::device::Device> {
     let candidates: Vec<_> = match name_filter {
         Some(filter) => devices
             .into_iter()
@@ -210,7 +210,7 @@ fn select_discovered_device(
     }
 }
 
-fn read_stdin_pcm(sender: airplay_audio::LiveFrameSender, sample_rate: u32) -> Result<()> {
+fn read_stdin_pcm(sender: homepod_sink::airplay::audio::LiveFrameSender, sample_rate: u32) -> Result<()> {
     let stdin = std::io::stdin();
     let mut lock = stdin.lock();
     // Read in smaller chunks than capture's 1024-sample PipeWire quantum
