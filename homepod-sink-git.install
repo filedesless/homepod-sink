@@ -10,3 +10,12 @@ post_install() {
 post_upgrade() {
     apply_setcap
 }
+
+pre_remove() {
+    # This runs as root with no reliable way to identify (or reach) the
+    # invoking user's systemd --user session, so it can't safely run
+    # `systemctl --user` itself - just tell the user to do it before the
+    # binary disappears out from under a still-running service.
+    echo "==> If homepod-sink.service is enabled/running, stop it first:"
+    echo "==>   systemctl --user disable --now homepod-sink"
+}
