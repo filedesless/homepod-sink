@@ -5,6 +5,16 @@ apply_setcap() {
 
 post_install() {
     apply_setcap
+    echo "==> To run homepod-sink at login:"
+    echo "==>   systemctl --user enable --now homepod-sink"
+    echo "==> Auto-discovery is used by default (connects if exactly one AirPlay"
+    echo "==> device is on the network). To target a specific device instead,"
+    echo "==> copy /etc/homepod-sink/homepod-sink.env.example to"
+    echo "==> ~/.config/homepod-sink/homepod-sink.env and set HOMEPOD_IP or"
+    echo "==> HOMEPOD_NAME. Find its name/IP by running"
+    echo "==>   /usr/lib/homepod-sink/homepod-sink"
+    echo "==> by hand: it prints the name and IP of the device it connects to,"
+    echo "==> or lists every device found if there's more than one."
 }
 
 post_upgrade() {
