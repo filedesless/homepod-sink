@@ -6,13 +6,14 @@ pkgdesc="Turns a HomePod into a PipeWire audio output via AirPlay 2"
 arch=('x86_64' 'aarch64')
 url="https://github.com/filedesless/homepod-sink"
 license=('GPL-3.0-or-later')
-depends=('pipewire')
+depends=('pipewire' 'libcap')
 makedepends=('cargo' 'git' 'clang' 'pkgconf' 'libpipewire')
 provides=('homepod-sink')
 conflicts=('homepod-sink')
 backup=('etc/homepod-sink/homepod-sink.env.example')
 source=("$pkgname::git+$url.git")
 sha256sums=('SKIP')
+install=$pkgname.install
 
 pkgver() {
     cd "$srcdir/$pkgname"

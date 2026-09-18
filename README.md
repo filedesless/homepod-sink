@@ -47,7 +47,25 @@ makepkg -si
 This builds and installs the three binaries to `/usr/lib/homepod-sink/`
 (deliberately not on `PATH` — `capture` is too generic a name for that), plus
 a systemd user unit at `/usr/lib/systemd/user/homepod-sink.service` and an
-env file template at `/etc/homepod-sink/homepod-sink.env.example`. See
+env file template at `/etc/homepod-sink/homepod-sink.env.example`. It also
+runs `setcap cap_sys_nice+ep` on the installed `homepod-sink` binary
+automatically, so real-time scheduling works out of the box (see
+[Tuning](#tuning)).
+
+**Switching from a manual/from-source install:** if you already have a unit
+at `~/.config/systemd/user/homepod-sink.service` (e.g. from following the
+from-source instructions below), it takes precedence over the package's
+`/usr/lib/systemd/user/homepod-sink.service` — same filename, and
+user-level units always win over system-level ones — so the package's unit
+would silently never run. Disable and remove the old one first:
+
+```sh
+systemctl --user disable --now homepod-sink
+rm ~/.config/systemd/user/homepod-sink.service
+systemctl --user daemon-reload
+```
+
+See
 [Running as a systemd service](#running-as-a-systemd-service) below to
 enable it. Uninstall with `sudo pacman -R homepod-sink-git`.
 

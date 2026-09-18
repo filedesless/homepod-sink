@@ -1,0 +1,12 @@
+apply_setcap() {
+    setcap cap_sys_nice+ep /usr/lib/homepod-sink/homepod-sink || \
+        echo "==> WARNING: setcap cap_sys_nice+ep failed - homepod-sink will run without real-time scheduling."
+}
+
+post_install() {
+    apply_setcap
+}
+
+post_upgrade() {
+    apply_setcap
+}
