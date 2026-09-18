@@ -1745,7 +1745,7 @@ mod tests {
 
     mod connection_state {
         use super::*;
-        use crate::airplay::core::{codec::{AudioCodec, AudioFormat, SampleRate}, stream::StreamType, DeviceId};
+        use crate::airplay::core::{codec::{AudioCodec, AudioFormat, SampleRate}, stream::{StreamType, TimingProtocol}, DeviceId};
 
         fn make_test_device() -> Device {
             Device {

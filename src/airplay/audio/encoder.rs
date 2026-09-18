@@ -164,6 +164,7 @@ pub fn create_encoder(format: AudioFormat) -> Result<Box<dyn AudioEncoder>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::airplay::core::SampleRate;
 
     fn alac_format_44100() -> AudioFormat {
         AudioFormat {

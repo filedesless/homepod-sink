@@ -2,14 +2,12 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use crate::airplay::core::error::{Error as CoreError, Result, RtspError};
 use crate::airplay::crypto::chacha::ControlCipher;
 use async_trait::async_trait;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 use super::traits::RtspTransport;
@@ -301,34 +299,6 @@ impl RtspTransport for RtspConnection {
     }
 }
 
-/// Thread-safe RTSP connection wrapper.
-pub struct SharedRtspConnection {
-    inner: Arc<Mutex<RtspConnection>>,
-}
-
-impl SharedRtspConnection {
-    pub fn new(conn: RtspConnection) -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(conn)),
-        }
-    }
-
-    pub async fn send(&self, request: RtspRequest) -> Result<RtspResponse> {
-        let mut conn = self.inner.lock().await;
-        conn.send(request).await
-    }
-
-    pub async fn close(&self) -> Result<()> {
-        let mut conn = self.inner.lock().await;
-        conn.close().await
-    }
-
-    pub async fn is_connected(&self) -> bool {
-        let conn = self.inner.lock().await;
-        conn.is_connected()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -459,25 +429,6 @@ mod tests {
 
             conn.clear_session_headers();
             assert!(conn.session_headers.is_empty());
-        }
-    }
-
-    mod shared_connection {
-        use super::*;
-
-        #[tokio::test]
-        async fn shared_connection_is_not_connected_initially() {
-            let conn = RtspConnection::new(test_addr());
-            let shared = SharedRtspConnection::new(conn);
-            assert!(!shared.is_connected().await);
-        }
-
-        #[tokio::test]
-        async fn shared_connection_close_works() {
-            let conn = RtspConnection::new(test_addr());
-            let shared = SharedRtspConnection::new(conn);
-            let result = shared.close().await;
-            assert!(result.is_ok());
         }
     }
 }

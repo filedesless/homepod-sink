@@ -11,10 +11,8 @@ mod controller;
 mod pair_setup;
 mod pair_verify;
 mod session;
-mod traits;
 
 pub use controller::ControllerIdentity;
-pub use pair_setup::{PairSetup, TransientPairSetup};
+pub use pair_setup::PairSetup;
 pub use pair_verify::PairVerify;
 pub use session::{PairingSession, PairingStep};
-pub use traits::{PairingHandler, Transport};

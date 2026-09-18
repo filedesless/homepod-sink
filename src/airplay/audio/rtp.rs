@@ -69,14 +69,12 @@ fn set_socket_qos(socket: &UdpSocket) {
 
 /// RTP payload types for AirPlay.
 pub mod payload_types {
-    pub const TIMING_REQUEST: u8 = 82;
-    pub const TIMING_RESPONSE: u8 = 83;
-    pub const SYNC: u8 = 84;
     pub const RETRANSMIT_REQUEST: u8 = 85;
     pub const RETRANSMIT_RESPONSE: u8 = 86;
+    /// Used by `RtpSender::send_ptp_sync`/`prepare_ptp_sync`, reachable only
+    /// when `TimingProtocol::Ptp` is selected — unused by homepod-sink's
+    /// binaries (NTP-only) but real, tested wire-format logic kept intact.
     pub const PTP_SYNC: u8 = 87;
-    pub const AUDIO_REALTIME: u8 = 96;
-    pub const AUDIO_BUFFERED: u8 = 103;
 }
 
 /// RTP header (12 bytes).
@@ -1325,45 +1323,6 @@ mod tests {
                 "sync must arrive from control port {}, got {}",
                 control_port, src_addr.port()
             );
-        }
-    }
-
-    mod packet_formats {
-        use super::*;
-
-        #[test]
-        fn audio_packet_type_96() {
-            assert_eq!(payload_types::AUDIO_REALTIME, 96);
-        }
-
-        #[test]
-        fn buffered_audio_packet_type_103() {
-            assert_eq!(payload_types::AUDIO_BUFFERED, 103);
-        }
-
-        #[test]
-        fn sync_packet_type_84() {
-            assert_eq!(payload_types::SYNC, 84);
-        }
-
-        #[test]
-        fn timing_request_type_82() {
-            assert_eq!(payload_types::TIMING_REQUEST, 82);
-        }
-
-        #[test]
-        fn timing_response_type_83() {
-            assert_eq!(payload_types::TIMING_RESPONSE, 83);
-        }
-
-        #[test]
-        fn retransmit_request_type_85() {
-            assert_eq!(payload_types::RETRANSMIT_REQUEST, 85);
-        }
-
-        #[test]
-        fn retransmit_response_type_86() {
-            assert_eq!(payload_types::RETRANSMIT_RESPONSE, 86);
         }
     }
 

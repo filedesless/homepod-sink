@@ -44,7 +44,6 @@ pub struct SessionPorts {
 /// Active RTSP session with a receiver.
 pub struct RtspSession {
     session_id: Uuid,
-    group_uuid: Uuid,
     state: SessionState,
     device: Device,
     client_device_id: String,
@@ -90,7 +89,6 @@ impl RtspSession {
 
         Self {
             session_id: Uuid::new_v4(),
-            group_uuid: device.group_id.unwrap_or_else(Uuid::new_v4),
             state: SessionState::Disconnected,
             device,
             client_device_id,

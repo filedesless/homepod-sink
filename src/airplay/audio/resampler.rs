@@ -41,8 +41,6 @@ const SINC_PARAMS: SincInterpolationParameters = SincInterpolationParameters {
 pub struct Resampler {
     inner: SincFixedIn<f32>,
     channels: usize,
-    source_rate: u32,
-    target_rate: u32,
     chunk_size: usize,
     /// Buffered input samples per channel, not yet consumed by `inner`.
     input_buffer: Vec<Vec<f32>>,
@@ -116,31 +114,9 @@ impl Resampler {
         Ok(Self {
             inner,
             channels: channels_usize,
-            source_rate,
-            target_rate,
             chunk_size,
             input_buffer: vec![Vec::new(); channels_usize],
         })
-    }
-
-    /// Get the source sample rate.
-    pub fn source_rate(&self) -> u32 {
-        self.source_rate
-    }
-
-    /// Get the target sample rate.
-    pub fn target_rate(&self) -> u32 {
-        self.target_rate
-    }
-
-    /// Get the number of channels.
-    pub fn channels(&self) -> usize {
-        self.channels
-    }
-
-    /// Get number of input frames needed for next process call.
-    pub fn input_frames_next(&self) -> usize {
-        self.inner.input_frames_next()
     }
 
     /// Reset the resampler state (for seeking).
@@ -336,10 +312,6 @@ mod tests {
         fn creates_48k_to_44k_resampler() {
             let resampler = Resampler::new(48000, 44100, 2);
             assert!(resampler.is_ok());
-            let resampler = resampler.unwrap();
-            assert_eq!(resampler.source_rate(), 48000);
-            assert_eq!(resampler.target_rate(), 44100);
-            assert_eq!(resampler.channels(), 2);
         }
 
         #[test]
@@ -352,7 +324,6 @@ mod tests {
         fn creates_mono_resampler() {
             let resampler = Resampler::new(48000, 44100, 1);
             assert!(resampler.is_ok());
-            assert_eq!(resampler.unwrap().channels(), 1);
         }
     }
 
