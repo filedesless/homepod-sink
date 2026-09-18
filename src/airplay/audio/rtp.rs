@@ -71,9 +71,10 @@ fn set_socket_qos(socket: &UdpSocket) {
 pub mod payload_types {
     pub const RETRANSMIT_REQUEST: u8 = 85;
     pub const RETRANSMIT_RESPONSE: u8 = 86;
-    /// Used by `RtpSender::send_ptp_sync`/`prepare_ptp_sync`, reachable only
-    /// when `TimingProtocol::Ptp` is selected — unused by homepod-sink's
-    /// binaries (NTP-only) but real, tested wire-format logic kept intact.
+    /// `RtpSender::send_ptp_sync`/`prepare_ptp_sync` hardcode this byte
+    /// (0xD7 = marker | 87) directly rather than referencing this constant,
+    /// so it's only ever read by tests that verify the wire format matches.
+    #[cfg(test)]
     pub const PTP_SYNC: u8 = 87;
 }
 

@@ -4,11 +4,13 @@
 //! side (responding to the receiver's timing requests) is implemented —
 //! the sender never initiates timing requests itself.
 
+use super::Clock;
+#[cfg(test)]
+use super::ntp_to_unix;
 use crate::airplay::core::error::{Error, Result};
 use std::sync::Arc;
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::watch;
-use super::{Clock, ntp_to_unix};
 
 /// RTP payload type for timing request.
 pub const TIMING_REQUEST_PT: u8 = 82;
@@ -35,6 +37,10 @@ pub struct NtpRequest {
 
 impl NtpRequest {
     /// Create new request with current time.
+    ///
+    /// Only used by tests (this sender never initiates NTP requests itself
+    /// in production - see the module doc comment).
+    #[cfg(test)]
     pub fn new(clock: &Clock) -> Self {
         Self {
             sequence: 0,
@@ -42,13 +48,10 @@ impl NtpRequest {
         }
     }
 
-    /// Create with specific sequence number.
-    pub fn with_sequence(mut self, seq: u16) -> Self {
-        self.sequence = seq;
-        self
-    }
-
     /// Serialize to 32 bytes.
+    ///
+    /// Only used by tests (see `new` above).
+    #[cfg(test)]
     pub fn serialize(&self) -> [u8; 32] {
         let mut buf = [0u8; 32];
 
@@ -72,8 +75,8 @@ impl NtpRequest {
         if data.len() < 32 {
             return Err(Error::Parse(
                 crate::airplay::core::error::ParseError::InvalidFormat(
-                    "NTP request too short".into()
-                )
+                    "NTP request too short".into(),
+                ),
             ));
         }
 
@@ -81,9 +84,10 @@ impl NtpRequest {
         let pt = data[1] & 0x7F;
         if pt != TIMING_REQUEST_PT {
             return Err(Error::Parse(
-                crate::airplay::core::error::ParseError::InvalidFormat(
-                    format!("Expected PT={}, got {}", TIMING_REQUEST_PT, pt)
-                )
+                crate::airplay::core::error::ParseError::InvalidFormat(format!(
+                    "Expected PT={}, got {}",
+                    TIMING_REQUEST_PT, pt
+                )),
             ));
         }
 
@@ -95,15 +99,6 @@ impl NtpRequest {
             sequence,
             reference_time,
         })
-    }
-}
-
-impl Default for NtpRequest {
-    fn default() -> Self {
-        Self {
-            sequence: 0,
-            reference_time: 0,
-        }
     }
 }
 
@@ -153,12 +148,20 @@ impl NtpResponse {
     }
 
     /// Parse from bytes.
+    ///
+    /// Only used by tests: this sender only ever builds/sends NtpResponse
+    /// (via `serialize`, from `run_loop` below) and never receives one, so
+    /// nothing in production needs to parse one back - see the module doc
+    /// comment. Tests use this to verify `serialize`'s wire format and, in
+    /// `responds_to_timing_request`, to check a real UDP response from
+    /// `NtpTimingServer`.
+    #[cfg(test)]
     pub fn parse(data: &[u8]) -> Result<Self> {
         if data.len() < 32 {
             return Err(Error::Parse(
                 crate::airplay::core::error::ParseError::InvalidFormat(
-                    "NTP response too short".into()
-                )
+                    "NTP response too short".into(),
+                ),
             ));
         }
 
@@ -166,9 +169,10 @@ impl NtpResponse {
         let pt = data[1] & 0x7F;
         if pt != TIMING_RESPONSE_PT {
             return Err(Error::Parse(
-                crate::airplay::core::error::ParseError::InvalidFormat(
-                    format!("Expected PT={}, got {}", TIMING_RESPONSE_PT, pt)
-                )
+                crate::airplay::core::error::ParseError::InvalidFormat(format!(
+                    "Expected PT={}, got {}",
+                    TIMING_RESPONSE_PT, pt
+                )),
             ));
         }
 
@@ -193,6 +197,11 @@ impl NtpResponse {
     /// - t2 = receive_time (their receive time)
     /// - t3 = send_time (their send time)
     /// - t4 = local_recv_time (our receive time)
+    ///
+    /// Only used by tests - see `parse` above. This sender is always the
+    /// timing reference for NTP (offset 0), so nothing in production
+    /// computes an RTT/offset against a peer's response.
+    #[cfg(test)]
     pub fn round_trip_time(&self, local_recv_time: u64) -> i64 {
         let t1 = ntp_to_unix(self.reference_time) as i64;
         let t2 = ntp_to_unix(self.receive_time) as i64;
@@ -206,6 +215,9 @@ impl NtpResponse {
     ///
     /// Offset = ((t2 - t1) + (t3 - t4)) / 2
     /// Positive offset means remote is ahead.
+    ///
+    /// Only used by tests - see `round_trip_time` above.
+    #[cfg(test)]
     pub fn clock_offset(&self, local_recv_time: u64) -> i64 {
         let t1 = ntp_to_unix(self.reference_time) as i64;
         let t2 = ntp_to_unix(self.receive_time) as i64;
@@ -221,6 +233,12 @@ impl NtpResponse {
 /// The AirPlay receiver sends NTP timing requests to verify clock synchronization.
 /// This server listens on a UDP port and responds with accurate timestamps.
 pub struct NtpTimingServer {
+    // Never read directly - `start` clones this into `run_loop`'s own
+    // `task_socket`, which is what actually sends/receives. Held here only
+    // so the Arc's refcount keeps the socket alive for as long as this
+    // server exists; dropping this field would let the listener close out
+    // from under the still-running background task.
+    #[allow(dead_code)]
     socket: Arc<TokioUdpSocket>,
     port: u16,
     shutdown_tx: watch::Sender<bool>,
@@ -386,15 +404,18 @@ mod tests {
             // t1 = 0, t2 = 10ms, t3 = 10ms, t4 = 20ms
             // RTT = (t4 - t1) - (t3 - t2) = 20ms - 0ms = 20ms
             let response = make_response(
-                0,
-                10_000_000, // 10ms
+                0, 10_000_000, // 10ms
                 10_000_000, // 10ms
             );
             let t4 = unix_to_ntp(20_000_000); // 20ms
 
             let rtt = response.round_trip_time(t4);
             // Allow small rounding error from NTP conversion
-            assert!((rtt - 20_000_000).abs() <= 2, "RTT {} not within tolerance of 20ms", rtt);
+            assert!(
+                (rtt - 20_000_000).abs() <= 2,
+                "RTT {} not within tolerance of 20ms",
+                rtt
+            );
         }
 
         #[test]
@@ -403,15 +424,18 @@ mod tests {
             // t1 = 0, t2 = 15ms, t3 = 15ms, t4 = 20ms
             // offset = ((t2 - t1) + (t3 - t4)) / 2 = (15 + (15 - 20)) / 2 = 10 / 2 = 5ms
             let response = make_response(
-                0,
-                15_000_000, // 15ms
+                0, 15_000_000, // 15ms
                 15_000_000, // 15ms
             );
             let t4 = unix_to_ntp(20_000_000); // 20ms
 
             let offset = response.clock_offset(t4);
             // Allow small rounding error from NTP conversion
-            assert!((offset - 5_000_000).abs() <= 2, "Offset {} not within tolerance of 5ms", offset);
+            assert!(
+                (offset - 5_000_000).abs() <= 2,
+                "Offset {} not within tolerance of 5ms",
+                offset
+            );
         }
 
         #[test]
@@ -558,5 +582,4 @@ mod tests {
             server.stop().await;
         }
     }
-
 }
