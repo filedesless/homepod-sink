@@ -7,7 +7,7 @@
 
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, StreamCipher};
 use aes::Aes128;
-use aes_gcm::{Aes128Gcm, Nonce as GcmNonce, Tag};
+use aes_gcm::{Aes128Gcm, Nonce as GcmNonce};
 use aes_gcm::aead::{Aead, KeyInit as AeadKeyInit};
 use crate::airplay::core::error::CryptoError;
 use ctr::cipher::KeyIvInit;

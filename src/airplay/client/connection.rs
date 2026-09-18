@@ -15,12 +15,10 @@ use crate::airplay::audio::cipher::{PacketCipher, ChaChaPacketCipher};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use crate::airplay::crypto::chacha::ControlCipher;
 use crate::airplay::crypto::chacha::AudioCipher;
-use crate::airplay::crypto::keys::SharedSecret;
 use super::PlaybackState;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use tracing::{debug, info, warn};
 use crate::airplay::timing::{NtpTimingServer, ClockOffset};
-use crate::airplay::core::stream::TimingProtocol;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio::net::TcpStream;
@@ -391,7 +389,7 @@ impl Connection {
         let controller = persistent_id.to_controller().ok_or_else(|| {
             RtspError::SetupFailed("Invalid persisted identity".into())
         })?;
-        let identity = controller.keypair().clone();
+        let _identity = controller.keypair().clone();
 
         // 1. TCP connect
         let ip_addr = select_best_address(&device.addresses)

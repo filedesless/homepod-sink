@@ -6,7 +6,6 @@
 
 use crate::airplay::core::error::{Error, Result};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::watch;
 use super::{Clock, ntp_to_unix};

@@ -4,7 +4,7 @@ use crate::airplay::core::{StreamConfig, error::Result};
 use super::{AudioBuffer, AudioDecoder, RtpSender, LiveAudioDecoder};
 use super::encoder::{create_encoder, AudioEncoder};
 use super::eq::{EqConfig, EqParams, Equalizer};
-use super::spatial::{SpatialMixer, SpatialParams, SpatialSnapshot, SpeakerConfig, Position};
+use super::spatial::{SpatialMixer, SpatialParams, SpatialSnapshot, SpeakerConfig};
 use crate::airplay::timing::{Clock, ClockOffset, unix_to_ntp};
 use std::sync::{Arc, atomic::{AtomicU64, AtomicU8, Ordering}};
 use tokio::sync::{Mutex, watch};
@@ -109,7 +109,7 @@ enum SenderMessage {
 /// falls back to spin_sleep.
 #[cfg(target_os = "linux")]
 fn precise_sleep_until(deadline_ns: u64) {
-    use std::mem;
+    
 
     let ts = libc::timespec {
         tv_sec: (deadline_ns / 1_000_000_000) as libc::time_t,

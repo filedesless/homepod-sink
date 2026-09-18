@@ -1,6 +1,6 @@
 //! Audio encoding for AirPlay streaming.
 
-use crate::airplay::core::{AudioFormat, AudioCodec, SampleRate, error::Result};
+use crate::airplay::core::{AudioFormat, AudioCodec, error::Result};
 
 /// Encoded audio packet.
 #[derive(Debug, Clone)]
