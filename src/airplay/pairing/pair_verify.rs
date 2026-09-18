@@ -1169,7 +1169,6 @@ impl PairVerify {
 #[cfg(test)]
 pub(crate) struct MockVerifyServer {
     identity: IdentityKeyPair,
-    ecdh: Option<EcdhKeyPair>,
     client_public: Option<[u8; 32]>,
     shared_secret: Option<[u8; 32]>,
     session_key: Option<[u8; 32]>,
@@ -1181,7 +1180,6 @@ impl MockVerifyServer {
     pub(crate) fn new() -> Self {
         Self {
             identity: IdentityKeyPair::generate(),
-            ecdh: None,
             client_public: None,
             shared_secret: None,
             session_key: None,
@@ -1192,7 +1190,6 @@ impl MockVerifyServer {
     pub(crate) fn with_identity(identity: IdentityKeyPair) -> Self {
         Self {
             identity,
-            ecdh: None,
             client_public: None,
             shared_secret: None,
             session_key: None,
@@ -1277,16 +1274,17 @@ impl MockVerifyServer {
         // Parse inner TLV
         let inner_tlv = Tlv8::parse(&decrypted)?;
 
-        let client_identifier = inner_tlv
+        // Extracted for realism (a real server would verify these against a
+        // known client key) but intentionally unchecked — this mock only
+        // needs to accept any well-formed M3 so PairVerify's client-side
+        // logic (the code actually shipped) has a server to test against.
+        let _client_identifier = inner_tlv
             .get(TlvType::Identifier)
             .ok_or(PairingError::MissingTlv(TlvType::Identifier as u8))?;
 
-        let client_signature = inner_tlv
+        let _client_signature = inner_tlv
             .get(TlvType::Signature)
             .ok_or(PairingError::MissingTlv(TlvType::Signature as u8))?;
-
-        // Verify signature (in real server, would verify against known client key)
-        // For testing, we just accept any valid signature format
 
         // Return M4 (success)
         let mut response = Tlv8::new();

@@ -3,6 +3,12 @@ name = "homepod-sink"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+# Dumps the SRP handshake transcript (salt, public keys, proofs) to stderr
+# for comparing against known-good implementations like shairport-sync when
+# pairing fails at M4. See airplay/crypto/srp.rs::dump_transcript.
+srp-debug = []
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }

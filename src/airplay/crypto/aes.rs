@@ -5,7 +5,7 @@
 //! - AES-128-GCM for fruit pair-setup phase 3
 //! - AES-128-CTR for fruit pair-verify phase 2
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, StreamCipher};
+use aes::cipher::{BlockDecrypt, BlockEncrypt, StreamCipher};
 use aes::Aes128;
 use aes_gcm::{Aes128Gcm, Nonce as GcmNonce};
 use aes_gcm::aead::{Aead, KeyInit as AeadKeyInit};

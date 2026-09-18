@@ -499,7 +499,7 @@ mod tests {
     /// Test that decoded frames can be encoded with ALAC encoder.
     #[test]
     fn full_encoder_pipeline() {
-        use super::super::encoder::{create_encoder, AudioEncoder};
+        use super::super::encoder::create_encoder;
 
         let (sender, mut decoder) = LiveAudioDecoder::create_pair(44100, 2, 16);
         decoder.set_recv_timeout(Duration::from_millis(50));
