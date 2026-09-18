@@ -17,56 +17,6 @@ pub fn decode<T: for<'de> Deserialize<'de>>(data: &[u8]) -> Result<T> {
         .map_err(|e| RtspError::PlistError(e.to_string()).into())
 }
 
-/// Device info response from /info endpoint.
-#[derive(Debug, Clone, Deserialize)]
-pub struct InfoResponse {
-    pub features: Option<u64>,
-    #[serde(rename = "statusFlags")]
-    pub status_flags: Option<u32>,
-    pub model: Option<String>,
-    #[serde(rename = "sourceVersion")]
-    pub source_version: Option<String>,
-    /// Ed25519 public key - stored as plist Data
-    #[serde(default, deserialize_with = "deserialize_data_option")]
-    pub pk: Option<Vec<u8>>,
-    pub pi: Option<String>,
-    #[serde(rename = "deviceID")]
-    pub device_id: Option<String>,
-    pub name: Option<String>,
-    #[serde(rename = "macAddress")]
-    pub mac_address: Option<String>,
-    #[serde(rename = "audioFormats", default)]
-    pub audio_formats: Vec<AudioFormatInfo>,
-}
-
-/// Deserializer for optional plist Data to Vec<u8>
-fn deserialize_data_option<'de, D>(deserializer: D) -> std::result::Result<Option<Vec<u8>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::de::{Deserialize, Error};
-
-    // Try to deserialize as plist::Value first
-    let value: Option<plist::Value> = Option::deserialize(deserializer)?;
-
-    match value {
-        Some(plist::Value::Data(data)) => Ok(Some(data)),
-        Some(_) => Err(D::Error::custom("expected data type for pk field")),
-        None => Ok(None),
-    }
-}
-
-/// Audio format descriptor from /info.
-#[derive(Debug, Clone, Deserialize)]
-pub struct AudioFormatInfo {
-    #[serde(rename = "type")]
-    pub format_type: Option<u32>,
-    #[serde(rename = "audioInputFormats")]
-    pub audio_input_formats: Option<u32>,
-    #[serde(rename = "audioOutputFormats")]
-    pub audio_output_formats: Option<u32>,
-}
-
 /// Timing peer info for PTP.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimingPeerInfo {
@@ -216,49 +166,6 @@ mod tests {
             let decoded: TestStruct = decode(&encoded).unwrap();
 
             assert_eq!(original, decoded);
-        }
-    }
-
-    mod info_response {
-        use super::*;
-
-        #[test]
-        fn decode_minimal_info() {
-            // Create a minimal plist with just a few fields
-            let mut dict = Dictionary::new();
-            dict.insert("model".to_string(), plist::Value::String("AppleTV5,3".to_string()));
-
-            let encoded = encode_raw(&dict).unwrap();
-            let info: InfoResponse = decode(&encoded).unwrap();
-
-            assert_eq!(info.model, Some("AppleTV5,3".to_string()));
-            assert!(info.features.is_none());
-            assert!(info.pk.is_none());
-        }
-
-        #[test]
-        fn decode_full_info() {
-            let mut dict = Dictionary::new();
-            dict.insert("model".to_string(), plist::Value::String("AppleTV5,3".to_string()));
-            dict.insert("sourceVersion".to_string(), plist::Value::String("366.0".to_string()));
-            dict.insert("features".to_string(), plist::Value::Integer(0x445F8A00i64.into()));
-            dict.insert("statusFlags".to_string(), plist::Value::Integer(0x404i64.into()));
-            dict.insert("pk".to_string(), plist::Value::Data(vec![0xAAu8; 32]));
-            dict.insert("pi".to_string(), plist::Value::String("abc-123".to_string()));
-            dict.insert("deviceID".to_string(), plist::Value::String("AA:BB:CC:DD:EE:FF".to_string()));
-            dict.insert("name".to_string(), plist::Value::String("Living Room".to_string()));
-
-            let encoded = encode_raw(&dict).unwrap();
-            let info: InfoResponse = decode(&encoded).unwrap();
-
-            assert_eq!(info.model, Some("AppleTV5,3".to_string()));
-            assert_eq!(info.source_version, Some("366.0".to_string()));
-            assert_eq!(info.features, Some(0x445F8A00));
-            assert_eq!(info.status_flags, Some(0x404));
-            assert_eq!(info.pk, Some(vec![0xAAu8; 32]));
-            assert_eq!(info.pi, Some("abc-123".to_string()));
-            assert_eq!(info.device_id, Some("AA:BB:CC:DD:EE:FF".to_string()));
-            assert_eq!(info.name, Some("Living Room".to_string()));
         }
     }
 
