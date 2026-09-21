@@ -1,20 +1,10 @@
-apply_setcap() {
-    setcap cap_sys_nice+ep /usr/lib/homepod-sink/homepod-sink || \
-        echo "==> WARNING: setcap cap_sys_nice+ep failed - homepod-sink will run without real-time scheduling."
-}
-
 post_install() {
-    apply_setcap
     echo "==> To run homepod-sink at login:"
     echo "==>   systemctl --user enable --now homepod-sink"
     echo "==> homepod-sink creates a PipeWire virtual sink for every AirPlay 2"
     echo "==> device it finds on the network - pick which one to use from your"
     echo "==> system's audio output picker (e.g. Noctalia), same as any other"
     echo "==> output device. Nothing to configure to select a target."
-}
-
-post_upgrade() {
-    apply_setcap
 }
 
 pre_remove() {

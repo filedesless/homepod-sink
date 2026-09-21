@@ -53,10 +53,7 @@ makepkg -si
 This builds and installs both binaries to `/usr/lib/homepod-sink/`
 (deliberately not on `PATH`), plus a systemd user unit at
 `/usr/lib/systemd/user/homepod-sink.service` and an env file template at
-`/etc/homepod-sink/homepod-sink.env.example`. It also runs
-`setcap cap_sys_nice+ep` on the installed `homepod-sink` binary
-automatically, so real-time scheduling works out of the box (see
-[Tuning](#tuning)).
+`/etc/homepod-sink/homepod-sink.env.example`.
 
 **Switching from a manual/from-source install:** if you already have a unit
 at `~/.config/systemd/user/homepod-sink.service` (e.g. from following the
@@ -94,7 +91,6 @@ This produces `target/release/{homepod-sink,play}`.
 ## Usage
 
 ```sh
-sudo setcap cap_sys_nice+ep target/release/homepod-sink   # see Tuning
 ./target/release/homepod-sink
 ```
 
@@ -173,23 +169,6 @@ journalctl --user -u homepod-sink -f
 ```
 
 ## Tuning
-
-- **Real-time scheduling**: without elevated privileges, `homepod-sink` logs
-  `Failed to set RT priority (need CAP_SYS_NICE or root)` and falls back to
-  normal scheduling. Grant it with:
-
-  ```sh
-  sudo setcap cap_sys_nice+ep target/release/homepod-sink
-  ```
-
-  (the Arch package does this automatically on install). Worth noting: this
-  was tested head-to-head against a HomePod with and without the capability,
-  and it made no measurable difference to the RTP send-timing jitter reported
-  in `TIMING STATS` log lines — `SCHED_FIFO` priority was confirmed applied
-  in both cases, but the packets-exceeding-tolerance rate (~3% either way)
-  was essentially identical. Whatever's causing that jitter, it isn't this
-  process's own CPU scheduling. Harmless to apply, just don't expect it to
-  fix audible jaggedness on its own.
 
 - **Sample rate**: `--sample-rate` should match your PipeWire graph's clock
   rate to avoid PipeWire's own (currently broken in this setup) rate
