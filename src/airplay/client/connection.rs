@@ -781,14 +781,20 @@ impl Connection {
         // This MUST be done before SETUP phase 2 or some devices return 500
         let events_addr = SocketAddr::new(addr, event_port);
         tracing::info!("Establishing events connection to {}", events_addr);
-        match TcpStream::connect(events_addr).await {
-            Ok(stream) => {
+        // Bounded like the main RTSP connect (see RtspConnection::CONNECT_TIMEOUT) -
+        // a dropped SYN here shouldn't be able to stall setup() for minutes just
+        // because the failure is already tolerated ("proceeding anyway").
+        match tokio::time::timeout(std::time::Duration::from_secs(5), TcpStream::connect(events_addr)).await {
+            Ok(Ok(stream)) => {
                 tracing::info!("Events connection established");
                 self.events_stream = Some(stream);
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 // Not fatal - owntone says "proceeding anyway" if this fails
                 warn!("Could not connect to events port {} (proceeding anyway): {}", events_addr, e);
+            }
+            Err(_) => {
+                warn!("Events port {} connect timed out (proceeding anyway)", events_addr);
             }
         }
 
@@ -854,7 +860,9 @@ impl Connection {
     pub async fn disconnect(&mut self) -> Result<()> {
         // Stop streaming if active
         if let Some(ref mut streamer) = self.streamer {
+            debug!("disconnect: stopping streamer");
             streamer.stop().await?;
+            debug!("disconnect: streamer stopped");
         }
 
         if let Some(task) = self.timing_task.take() {
@@ -863,17 +871,21 @@ impl Connection {
 
         // Stop timing server
         if let Some(mut server) = self.timing_server.take() {
+            debug!("disconnect: stopping timing server");
             server.stop().await;
+            debug!("disconnect: timing server stopped");
         }
 
         // Signal control thread to stop and wait for it to exit
         self.control_stop.store(true, Ordering::Release);
         if let Some(task) = self.control_task.take() {
+            debug!("disconnect: waiting for control task");
             // Give the control thread time to notice the stop flag (polls every 5ms)
             let _ = tokio::time::timeout(
                 std::time::Duration::from_millis(100),
                 task,
             ).await;
+            debug!("disconnect: control task done");
         }
 
         // Drop control receiver (closes the UDP socket)
@@ -881,13 +893,17 @@ impl Connection {
 
         // Send TEARDOWN if session is active
         if self.session.state() != SessionState::Disconnected {
+            debug!("disconnect: sending TEARDOWN");
             let _ = self.session.start_teardown();
             let teardown_req = RtspRequest::teardown(self.session.request_uri());
             let _ = self.rtsp.send(teardown_req).await;
+            debug!("disconnect: TEARDOWN done");
         }
 
         // Close connection
+        debug!("disconnect: closing rtsp connection");
         self.rtsp.close().await?;
+        debug!("disconnect: done");
         self.playback_state = PlaybackState::Stopped;
 
         Ok(())

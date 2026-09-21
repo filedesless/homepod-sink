@@ -276,8 +276,24 @@ impl NtpTimingServer {
     /// Stop the timing server.
     pub async fn stop(&mut self) {
         let _ = self.shutdown_tx.send(true);
-        if let Some(handle) = self.task_handle.take() {
-            let _ = handle.await;
+        if let Some(mut handle) = self.task_handle.take() {
+            // Bounded like every other teardown step in
+            // Connection::disconnect() - confirmed live that an unbounded
+            // await here can hang the whole disconnect indefinitely (a
+            // default-sink switch away from an actively streaming device
+            // stalled main.rs's event loop completely, with no further
+            // logs, until the process was killed). If the task hasn't
+            // exited by the time this fires, abort it directly rather than
+            // continuing to wait - a still-running NTP responder task after
+            // "disconnect" is harmless since its socket is about to be
+            // dropped anyway.
+            if tokio::time::timeout(std::time::Duration::from_secs(2), &mut handle)
+                .await
+                .is_err()
+            {
+                tracing::warn!("NTP timing server task didn't exit within 2s, aborting it");
+                handle.abort();
+            }
         }
     }
 

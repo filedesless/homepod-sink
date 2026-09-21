@@ -35,10 +35,19 @@ impl RtspConnection {
         }
     }
 
+    /// Timeout for the initial TCP connect. Without this, a dropped SYN
+    /// (device unreachable, firewall blackhole, dead Wi-Fi) leaves the
+    /// connect future waiting on the OS's own TCP retransmit timeout, which
+    /// can take minutes - long enough to stall main.rs's reconnect loop well
+    /// past its intended backoff schedule. Confirmed live: an unreachable
+    /// HomePod's connect attempt took ~2m14s to fail without this bound.
+    const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     /// Connect to the receiver.
     pub async fn connect(&mut self) -> Result<()> {
-        let stream = TcpStream::connect(self.addr)
+        let stream = timeout(Self::CONNECT_TIMEOUT, TcpStream::connect(self.addr))
             .await
+            .map_err(|_| RtspError::ConnectTimeout)?
             .map_err(|_| RtspError::ConnectionRefused)?;
         self.stream = Some(stream);
         Ok(())

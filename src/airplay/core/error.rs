@@ -95,6 +95,9 @@ pub enum RtspError {
     #[error("Connection refused")]
     ConnectionRefused,
 
+    #[error("Connection timed out")]
+    ConnectTimeout,
+
     #[error("Invalid response: {0}")]
     InvalidResponse(String),
 

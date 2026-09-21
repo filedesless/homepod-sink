@@ -22,7 +22,7 @@ pkgver() {
 
 build() {
     cd "$srcdir/$pkgname"
-    cargo build --release --locked --bin homepod-sink --bin capture --bin play
+    cargo build --release --locked --bin homepod-sink --bin play
 }
 
 check() {
@@ -34,7 +34,6 @@ package() {
     cd "$srcdir/$pkgname"
 
     install -Dm755 target/release/homepod-sink "$pkgdir/usr/lib/homepod-sink/homepod-sink"
-    install -Dm755 target/release/capture "$pkgdir/usr/lib/homepod-sink/capture"
     install -Dm755 target/release/play "$pkgdir/usr/lib/homepod-sink/play"
     install -Dm755 systemd/run.sh "$pkgdir/usr/lib/homepod-sink/run.sh"
 

@@ -1,8 +1,9 @@
 # homepod-sink
 
 Turns a HomePod (or other AirPlay 2 speaker) into a PipeWire audio output on
-Linux. Captures system audio via a virtual PipeWire sink and streams it over
-AirPlay 2 in real time.
+Linux. Creates a virtual PipeWire sink for every AirPlay 2 device on your
+network and streams system audio to whichever one you pick as your output,
+in real time.
 
 The AirPlay 2 protocol implementation (`src/airplay/`) started as a trimmed
 vendor of [airplay2-rs](https://github.com/filedesless/airplay2-rs) — cut down
@@ -12,26 +13,31 @@ now lives in this repo as ordinary source, not an external dependency.
 
 ## How it works
 
-Two binaries, piped together, running as separate processes on purpose (see
-below):
+One binary, `homepod-sink`:
 
-```
-capture  --(raw PCM over stdout)-->  homepod-sink  --(AirPlay 2 / RTP)-->  HomePod
-```
+- Runs continuous mDNS discovery for AirPlay 2 devices on the network.
+- Creates a PipeWire virtual sink for each one it finds, named after the
+  device, so they all show up in your system's audio output picker (e.g.
+  Noctalia) alongside your usual outputs.
+- Watches PipeWire's default-output setting. Whichever sink you select is
+  the one it actually opens an AirPlay connection to and streams to —
+  switching outputs in the picker tears down the old connection and opens a
+  new one, the same as switching between two USB speakers.
+- Every other sink stays present but idle: audio routed to it is silently
+  discarded rather than sent anywhere, so picking a different output never
+  errors or blocks.
 
-- **`capture`** creates a virtual PipeWire sink (shows up in your system's
-  audio output picker) and writes the raw interleaved 16-bit PCM it receives
-  to stdout.
-- **`homepod-sink`** reads that PCM from stdin, resamples/encodes it to ALAC,
-  and streams it to an AirPlay 2 device over the network.
+There's nothing to configure to select a device — picking the output *is*
+picking the device.
 
-They're split into separate processes because PipeWire grants its own audio
-thread real-time scheduling via rtkit — sharing a process with the AirPlay
-sender's own real-time thread caused unpredictable preemption between the two.
+PipeWire grants its own audio thread real-time scheduling via rtkit; the
+AirPlay sender runs on its own dedicated thread with `SCHED_FIFO` real-time
+scheduling instead (see [Tuning](#tuning)) rather than sharing rtkit's
+elevation, so the two don't contend with each other.
 
-A third binary, **`play`**, is a standalone diagnostic tool: it plays a local
-audio file directly to a hardcoded HomePod IP, bypassing PipeWire and the
-capture pipeline entirely. Useful for checking the AirPlay connection itself
+A second binary, **`play`**, is a standalone diagnostic tool: it plays a
+local audio file directly to a hardcoded HomePod IP, bypassing PipeWire and
+device discovery entirely. Useful for checking the AirPlay connection itself
 is healthy, independent of everything else.
 
 ## Installation
@@ -44,11 +50,11 @@ A `PKGBUILD` is included, building straight from this repo (`homepod-sink-git`):
 makepkg -si
 ```
 
-This builds and installs the three binaries to `/usr/lib/homepod-sink/`
-(deliberately not on `PATH` — `capture` is too generic a name for that), plus
-a systemd user unit at `/usr/lib/systemd/user/homepod-sink.service` and an
-env file template at `/etc/homepod-sink/homepod-sink.env.example`. It also
-runs `setcap cap_sys_nice+ep` on the installed `homepod-sink` binary
+This builds and installs both binaries to `/usr/lib/homepod-sink/`
+(deliberately not on `PATH`), plus a systemd user unit at
+`/usr/lib/systemd/user/homepod-sink.service` and an env file template at
+`/etc/homepod-sink/homepod-sink.env.example`. It also runs
+`setcap cap_sys_nice+ep` on the installed `homepod-sink` binary
 automatically, so real-time scheduling works out of the box (see
 [Tuning](#tuning)).
 
@@ -83,57 +89,35 @@ path dependency needed.
 cargo build --release
 ```
 
-This produces `target/release/{capture,homepod-sink,play}`.
+This produces `target/release/{homepod-sink,play}`.
 
 ## Usage
 
-### Quick start (auto-discovery)
-
-If there's exactly one AirPlay 2 device on your network, you don't need to
-know its IP:
-
 ```sh
-./target/release/capture &
+sudo setcap cap_sys_nice+ep target/release/homepod-sink   # see Tuning
 ./target/release/homepod-sink
 ```
 
-`homepod-sink` will discover devices on the network for a few seconds and
-connect automatically if exactly one is found. If it finds none, or more than
-one, it prints what it found (name, model, IP) and exits — pass `--ip` (or
-`--name`) to pick one explicitly:
+Every AirPlay 2 device on your network gets a PipeWire sink immediately.
+Open your system's audio output picker and select the one you want — that's
+it. `homepod-sink` connects to it, and switching outputs later reconnects to
+whichever one you pick next.
 
-```sh
+```
 $ ./target/release/homepod-sink
-discovering AirPlay devices...
-Error: found 2 devices, pass --ip (or a more specific --name) to select one:
-  Living Room  (AudioAccessory1,1)  192.168.0.13
-  Bedroom      (AudioAccessory1,1)  192.168.0.21
-
-$ ./target/release/homepod-sink --ip 192.168.0.13
-# or:
-$ ./target/release/homepod-sink --name "living"
+watching for AirPlay devices and PipeWire's default output...
+default output switched to Living Room - connecting
+connecting to Living Room (192.168.0.13)...
+streaming to Living Room at 48000Hz stereo
 ```
 
-Once running, select the virtual sink (`HomePod` by default) as your system's
-audio output.
-
 ### CLI reference
-
-**`capture`**
-
-| Flag | Default | Description |
-|---|---|---|
-| `--sink-name` | `HomePod` | Name of the virtual PipeWire sink, as shown in the output picker. |
-| `--sample-rate` | `48000` | Sample rate for the virtual sink. Should match your PipeWire graph's clock rate (`pw-metadata -n settings \| grep clock.rate`) — a mismatch makes PipeWire insert its own rate converter, which has been observed to silently produce zero-valued (silent) samples on this setup. |
 
 **`homepod-sink`**
 
 | Flag | Default | Description |
 |---|---|---|
-| `--ip` | *(none — triggers discovery)* | IP address of the AirPlay device to connect to. |
-| `--name` | *(none)* | Substring to match against discovered device names, used only when `--ip` is omitted and discovery finds more than one device. |
-| `--port` | `7000` | AirPlay control port. |
-| `--sample-rate` | `48000` | Sample rate of the incoming PCM from stdin — must match `capture`'s `--sample-rate`. Internally resampled to whatever the AirPlay stream needs (44.1kHz). |
+| `--sample-rate` | `48000` | Sample rate for every virtual sink. Should match your PipeWire graph's clock rate (`pw-metadata -n settings \| grep clock.rate`) — a mismatch makes PipeWire insert its own rate converter, which has been observed to silently produce zero-valued (silent) samples on this setup. Resampled to 44.1kHz for AirPlay internally regardless. |
 
 **`play`** (diagnostic only)
 
@@ -144,15 +128,23 @@ audio output.
 Sends to a hardcoded HomePod IP/port at the top of `src/bin/play.rs` — edit
 those constants for your device before building.
 
+### Reconnecting
+
+`homepod-sink` never gives up and exits on a lost connection. If the active
+device stops responding (feedback keepalives fail three times in a row —
+e.g. it lost power, dropped off Wi-Fi, or got a new IP from DHCP), it
+disconnects and retries discovery/connection to the same device with
+exponential backoff (2s up to 30s) until it comes back or you pick a
+different output. Every sink's PipeWire node stays alive throughout — audio
+routed to the disconnected one is simply dropped, not buffered, so nothing
+needs to be restarted.
+
 ## Running as a systemd service
 
 **If installed via the Arch package**, the unit is already at
 `/usr/lib/systemd/user/homepod-sink.service`:
 
 ```sh
-mkdir -p ~/.config/homepod-sink
-cp /etc/homepod-sink/homepod-sink.env.example ~/.config/homepod-sink/homepod-sink.env
-# edit ~/.config/homepod-sink/homepod-sink.env: set HOMEPOD_IP (or HOMEPOD_NAME)
 systemctl --user daemon-reload
 systemctl --user enable --now homepod-sink
 ```
@@ -164,26 +156,15 @@ run this as a persistent user service that starts with your session:
 mkdir -p ~/.config/systemd/user ~/.config/homepod-sink
 cp systemd/homepod-sink.service ~/.config/systemd/user/
 cp systemd/homepod-sink.env.example ~/.config/homepod-sink/homepod-sink.env
-# edit ~/.config/homepod-sink/homepod-sink.env: set HOMEPOD_IP (or HOMEPOD_NAME)
 systemctl --user daemon-reload
 systemctl --user enable --now homepod-sink
 ```
 
-Environment variables read by `systemd/run.sh` (see
-`systemd/homepod-sink.env.example`):
-
-| Variable | Required | Default | Maps to |
-|---|---|---|---|
-| `HOMEPOD_IP` | one of `HOMEPOD_IP`/`HOMEPOD_NAME` | — | `homepod-sink --ip` |
-| `HOMEPOD_NAME` | one of `HOMEPOD_IP`/`HOMEPOD_NAME` | — | `homepod-sink --name` |
-| `HOMEPOD_SINK_NAME` | no | `HomePod` | `capture --sink-name` |
-| `HOMEPOD_PORT` | no | `7000` | `homepod-sink --port` |
-| `HOMEPOD_SAMPLE_RATE` | no | `48000` | both binaries' `--sample-rate` |
-
-If neither `HOMEPOD_IP` nor `HOMEPOD_NAME` is set, `run.sh` leaves `--ip`
-unset and relies on auto-discovery — only reliable if exactly one AirPlay
-device is ever present on the network, since the service can't interactively
-resolve ambiguity.
+The only environment variable `systemd/run.sh` reads (see
+`systemd/homepod-sink.env.example`) is `HOMEPOD_SAMPLE_RATE` (default
+`48000`), mapped to `homepod-sink --sample-rate`. There's no target device
+to configure — pick one from your output picker as usual once the service
+is running.
 
 Check logs with:
 
@@ -202,9 +183,9 @@ journalctl --user -u homepod-sink -f
   sudo setcap cap_sys_nice+ep target/release/homepod-sink
   ```
 
-- **Sample rate**: `capture`'s `--sample-rate` should match your PipeWire
-  graph's clock rate to avoid PipeWire's own (currently broken in this setup)
-  rate conversion. Check with:
+- **Sample rate**: `--sample-rate` should match your PipeWire graph's clock
+  rate to avoid PipeWire's own (currently broken in this setup) rate
+  conversion. Check with:
 
   ```sh
   pw-metadata -n settings | grep clock.rate

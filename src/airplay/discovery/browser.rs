@@ -161,6 +161,67 @@ impl ServiceBrowser {
             _ => None,
         }
     }
+
+    /// Same logic as `handle_service_event`, callable from a plain OS
+    /// thread (not a tokio task) via `RwLock::blocking_write` instead of
+    /// `.await`. Used by `browse()`'s dedicated polling thread - see the
+    /// comment there for why that thread can't just `.await` the async
+    /// version.
+    fn handle_service_event_blocking(
+        event: ServiceEvent,
+        is_raop: bool,
+        devices: &Arc<RwLock<HashMap<DeviceId, Device>>>,
+    ) -> Option<BrowseEvent> {
+        match event {
+            ServiceEvent::ServiceResolved(info) => {
+                trace!("Service resolved: {}", info.get_fullname());
+                if let Some(device) = Self::parse_service_event(&info, is_raop) {
+                    let device_id = device.id.clone();
+                    let mut devices_guard = devices.blocking_write();
+
+                    let is_new = !devices_guard.contains_key(&device_id);
+
+                    if is_new {
+                        devices_guard.insert(device_id, device.clone());
+                        Some(BrowseEvent::Added(device))
+                    } else {
+                        let existing = devices_guard.get(&device_id).unwrap();
+                        let merged = if is_raop {
+                            TxtRecordParser::merge_device_info(existing, &device)
+                        } else {
+                            TxtRecordParser::merge_device_info(&device, existing)
+                        };
+                        devices_guard.insert(device_id, merged.clone());
+                        Some(BrowseEvent::Updated(merged))
+                    }
+                } else {
+                    None
+                }
+            }
+            ServiceEvent::ServiceRemoved(_, fullname) => {
+                trace!("Service removed: {}", fullname);
+                if let Some(device_id) = Self::extract_device_id_from_removal(&fullname, is_raop) {
+                    let mut devices_guard = devices.blocking_write();
+                    if devices_guard.remove(&device_id).is_some() {
+                        Some(BrowseEvent::Removed(device_id))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+            ServiceEvent::SearchStarted(_) => {
+                trace!("Search started");
+                None
+            }
+            ServiceEvent::SearchStopped(_) => {
+                trace!("Search stopped");
+                None
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Default for ServiceBrowser {
@@ -188,33 +249,61 @@ impl Discovery for ServiceBrowser {
         let devices = Arc::clone(&self.devices);
         let running = Arc::clone(&self.running);
 
-        // Create an async stream that processes events from both receivers
-        let stream = async_stream::stream! {
-            loop {
-                if !running.load(Ordering::SeqCst) {
-                    break;
-                }
+        // mdns-sd's browse receivers are plain crossbeam channels with only
+        // a blocking recv_timeout API - there's no way to .await them.
+        // Polling them from inside an async_stream::stream! body (the
+        // previous implementation) meant every poll of this stream blocked
+        // its executing task's OS thread for up to 100ms per channel (200ms
+        // total) with no yield point in between, since recv_timeout runs to
+        // completion synchronously. That's fine for a binary that only ever
+        // discovers once at startup, but it starves any other future being
+        // polled alongside this stream in a tokio::select! - confirmed live
+        // in homepod-sinkd, where PipeWire default-sink-change events sent
+        // on an unrelated channel were going unnoticed for many seconds (in
+        // one observed case, indefinitely) because this stream's poll kept
+        // tying up the task before the other branch got a chance to run.
+        //
+        // Fix: do the blocking work on a dedicated OS thread (never inside
+        // an async task), and forward results through a proper async
+        // mpsc channel - the standard pattern for wrapping a blocking API
+        // as an async stream.
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        std::thread::Builder::new()
+            .name("mdns-browse".into())
+            .spawn(move || {
+                loop {
+                    if !running.load(Ordering::SeqCst) {
+                        break;
+                    }
 
-                // Try to receive from either channel with a short timeout
-                let recv_timeout = Duration::from_millis(100);
+                    let recv_timeout = Duration::from_millis(100);
 
-                // Check AirPlay events
-                if let Ok(event) = airplay_receiver.recv_timeout(recv_timeout) {
-                    if let Some(browse_event) = Self::handle_service_event(event, false, &devices).await {
-                        yield browse_event;
+                    if let Ok(event) = airplay_receiver.recv_timeout(recv_timeout) {
+                        if let Some(browse_event) =
+                            Self::handle_service_event_blocking(event, false, &devices)
+                        {
+                            if tx.send(browse_event).is_err() {
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Ok(event) = raop_receiver.recv_timeout(recv_timeout) {
+                        if let Some(browse_event) =
+                            Self::handle_service_event_blocking(event, true, &devices)
+                        {
+                            if tx.send(browse_event).is_err() {
+                                break;
+                            }
+                        }
                     }
                 }
+            })
+            .map_err(|e| DiscoveryError::Daemon(format!("failed to spawn mdns-browse thread: {e}")))?;
 
-                // Check RAOP events
-                if let Ok(event) = raop_receiver.recv_timeout(recv_timeout) {
-                    if let Some(browse_event) = Self::handle_service_event(event, true, &devices).await {
-                        yield browse_event;
-                    }
-                }
-            }
-        };
-
-        Ok(Box::new(Box::pin(stream)))
+        Ok(Box::new(
+            tokio_stream::wrappers::UnboundedReceiverStream::new(rx),
+        ))
     }
 
     async fn scan(&self, timeout: Duration) -> Result<Vec<Device>> {

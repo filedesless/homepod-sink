@@ -25,7 +25,7 @@ pub struct DeviceInfo {
 }
 
 /// A discovered AirPlay receiver with full metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Device {
     // --- Core identity ---
     pub id: DeviceId,
