@@ -176,12 +176,20 @@ journalctl --user -u homepod-sink -f
 
 - **Real-time scheduling**: without elevated privileges, `homepod-sink` logs
   `Failed to set RT priority (need CAP_SYS_NICE or root)` and falls back to
-  normal scheduling — it still works, but is more exposed to scheduling
-  jitter under system load. To grant it:
+  normal scheduling. Grant it with:
 
   ```sh
   sudo setcap cap_sys_nice+ep target/release/homepod-sink
   ```
+
+  (the Arch package does this automatically on install). Worth noting: this
+  was tested head-to-head against a HomePod with and without the capability,
+  and it made no measurable difference to the RTP send-timing jitter reported
+  in `TIMING STATS` log lines — `SCHED_FIFO` priority was confirmed applied
+  in both cases, but the packets-exceeding-tolerance rate (~3% either way)
+  was essentially identical. Whatever's causing that jitter, it isn't this
+  process's own CPU scheduling. Harmless to apply, just don't expect it to
+  fix audible jaggedness on its own.
 
 - **Sample rate**: `--sample-rate` should match your PipeWire graph's clock
   rate to avoid PipeWire's own (currently broken in this setup) rate
