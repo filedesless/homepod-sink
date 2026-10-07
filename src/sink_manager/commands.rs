@@ -1,8 +1,8 @@
 //! Message types crossing the PipeWire-thread / async-runtime boundary,
-//! plus the pure logic for turning a "default sink changed" event into a
-//! decision about which AirPlay connection should be active.
+//! plus the pure logic for deciding which AirPlay connection (if any)
+//! should be active given which sinks are currently receiving audio.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::airplay::core::device::{Device, DeviceId};
 use crate::airplay::discovery::BrowseEvent;
@@ -18,6 +18,9 @@ pub enum PwCommand {
     /// should have its captured audio forwarded to the AirPlay sender,
     /// and the channel to forward it through.
     SetActiveTarget(Option<(DeviceId, crate::airplay::audio::LiveFrameSender)>),
+    /// Move a device's sink volume slider (0.0-1.0, unmuting if above 0),
+    /// e.g. to match the volume the device itself reported.
+    SetSinkVolume { id: DeviceId, volume: f32 },
     /// Stop the PipeWire mainloop and exit its thread.
     Shutdown,
 }
@@ -25,64 +28,84 @@ pub enum PwCommand {
 /// Sent from the PipeWire mainloop thread out to the async side.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SinkEvent {
-    /// PipeWire's `default.audio.sink` metadata changed. `None` means it
-    /// now points at a sink we don't own (or was cleared) - no device
-    /// should be active. `Some(id)` names one of our own device sinks.
-    DefaultSinkChanged(Option<DeviceId>),
+    /// A device's sink started playing (`playing: true`) - a stream
+    /// feeding it is running and audio is coming through - or stopped
+    /// (`false`): its streams were paused, or it has been silent for a
+    /// while. Any app routed to the sink counts - it doesn't need to be
+    /// the default output.
+    ActivityChanged { id: DeviceId, playing: bool },
+    /// A stream feeding a device's sink went from stopped to running:
+    /// someone pressed play on this machine.
+    PlaybackStarted { id: DeviceId },
+    /// A device's sink volume changed in PipeWire, as a 0.0-1.0 slider
+    /// position (what pavucontrol/wpctl show), 0.0 when muted.
+    VolumeChanged { id: DeviceId, volume: f32 },
 }
 
-/// What the AirPlay side should do in response to a `SinkEvent`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum StreamCommand {
-    /// Connect (or switch) to this device. Boxed for the same reason as
-    /// PwCommand::HandleBrowseEvent - Device is large relative to the
-    /// other (data-free) variants.
-    ConnectTo(Box<Device>),
-    /// No device should be active - disconnect if currently connected.
-    Disconnect,
-    /// Nothing changed that the AirPlay side needs to react to.
-    NoOp,
-}
-
-/// Turn a default-sink-changed event into a StreamCommand, given the
-/// currently-active device (if any) and a lookup of known devices by id.
+/// Decides which device (if any) should have a live AirPlay connection.
 ///
-/// Pure and separately testable so the switching decision doesn't need a
-/// running tokio select! loop or real channels to verify.
-pub fn derive_stream_command(
-    currently_active: Option<&DeviceId>,
-    event: &SinkEvent,
-    known_devices: &HashMap<DeviceId, Device>,
-) -> StreamCommand {
-    let SinkEvent::DefaultSinkChanged(new_id) = event;
+/// A device is wanted while audio is playing into its sink, unless another
+/// AirPlay sender (e.g. an iPhone) took the speaker over from us - then we
+/// leave it alone until play is pressed again here, rather than stealing
+/// it straight back while this machine's audio carries on regardless.
+///
+/// Pure and separately testable so the decision doesn't need a running
+/// tokio select! loop or real channels to verify.
+#[derive(Debug, Default)]
+pub struct Arbiter {
+    /// Devices whose sink is currently playing, in the order they started.
+    playing: Vec<DeviceId>,
+    /// Devices another sender took over mid-playback. Cleared when play
+    /// is pressed again here, or the device's sink stops playing.
+    yielded: HashSet<DeviceId>,
+}
 
-    match new_id {
-        None => {
-            if currently_active.is_some() {
-                StreamCommand::Disconnect
-            } else {
-                StreamCommand::NoOp
-            }
-        }
-        Some(id) => {
-            if currently_active == Some(id) {
-                return StreamCommand::NoOp;
-            }
-            match known_devices.get(id) {
-                Some(device) => StreamCommand::ConnectTo(Box::new(device.clone())),
-                // Default sink points at a device id we don't (or no
-                // longer) know about - e.g. it vanished from discovery in
-                // the same moment it stopped being default. Treat like no
-                // active device rather than connecting to stale info.
-                None => {
-                    if currently_active.is_some() {
-                        StreamCommand::Disconnect
-                    } else {
-                        StreamCommand::NoOp
-                    }
+impl Arbiter {
+    pub fn handle_sink_event(&mut self, event: &SinkEvent) {
+        match event {
+            SinkEvent::ActivityChanged { id, playing } => {
+                self.playing.retain(|p| p != id);
+                if *playing {
+                    self.playing.push(id.clone());
+                } else {
+                    self.yielded.remove(id);
                 }
             }
+            SinkEvent::PlaybackStarted { id } => {
+                self.yielded.remove(id);
+            }
+            SinkEvent::VolumeChanged { .. } => {}
         }
+    }
+
+    pub fn device_removed(&mut self, id: &DeviceId) {
+        self.playing.retain(|p| p != id);
+        self.yielded.remove(id);
+    }
+
+    /// Another sender took `id` over: don't reconnect to it until play is
+    /// pressed again here, or its sink stops and starts playing again.
+    pub fn yield_device(&mut self, id: &DeviceId) {
+        self.yielded.insert(id.clone());
+    }
+
+    /// The device that should be streamed to. Sticks with `current` while
+    /// it's still wanted, so a second sink starting to play doesn't yank
+    /// the connection away; otherwise picks the earliest-started playing
+    /// device we know how to reach.
+    pub fn target(
+        &self,
+        current: Option<&DeviceId>,
+        known_devices: &HashMap<DeviceId, Device>,
+    ) -> Option<DeviceId> {
+        let wanted =
+            |id: &DeviceId| !self.yielded.contains(id) && known_devices.contains_key(id);
+        if let Some(current) = current {
+            if self.playing.contains(current) && wanted(current) {
+                return Some(current.clone());
+            }
+        }
+        self.playing.iter().find(|id| wanted(id)).cloned()
     }
 }
 
@@ -134,96 +157,123 @@ mod tests {
         }
     }
 
-    mod derive_stream_command {
-        use super::*;
+    fn known(devices: &[&Device]) -> HashMap<DeviceId, Device> {
+        devices.iter().map(|d| (d.id.clone(), (*d).clone())).collect()
+    }
 
-        #[test]
-        fn none_to_none_is_noop() {
-            let known = HashMap::new();
-            let cmd = derive_stream_command(None, &SinkEvent::DefaultSinkChanged(None), &known);
-            assert_eq!(cmd, StreamCommand::NoOp);
-        }
+    fn activity(d: &Device, playing: bool) -> SinkEvent {
+        SinkEvent::ActivityChanged { id: d.id.clone(), playing }
+    }
 
-        #[test]
-        fn some_to_none_disconnects() {
-            let living_room = make_device([1, 0, 0, 0, 0, 1], "Living Room");
-            let known = HashMap::new();
-            let cmd = derive_stream_command(
-                Some(&living_room.id),
-                &SinkEvent::DefaultSinkChanged(None),
-                &known,
-            );
-            assert_eq!(cmd, StreamCommand::Disconnect);
-        }
+    #[test]
+    fn idle_has_no_target() {
+        let living_room = make_device([1, 0, 0, 0, 0, 1], "Living Room");
+        let arbiter = Arbiter::default();
+        assert_eq!(arbiter.target(None, &known(&[&living_room])), None);
+    }
 
-        #[test]
-        fn none_to_known_device_connects() {
-            let living_room = make_device([1, 0, 0, 0, 0, 1], "Living Room");
-            let mut known = HashMap::new();
-            known.insert(living_room.id.clone(), living_room.clone());
+    #[test]
+    fn playing_sink_becomes_target() {
+        let living_room = make_device([1, 0, 0, 0, 0, 1], "Living Room");
+        let mut arbiter = Arbiter::default();
+        arbiter.handle_sink_event(&activity(&living_room, true));
+        assert_eq!(
+            arbiter.target(None, &known(&[&living_room])),
+            Some(living_room.id.clone())
+        );
+    }
 
-            let cmd = derive_stream_command(
-                None,
-                &SinkEvent::DefaultSinkChanged(Some(living_room.id.clone())),
-                &known,
-            );
-            assert_eq!(cmd, StreamCommand::ConnectTo(Box::new(living_room)));
-        }
+    #[test]
+    fn going_quiet_clears_target() {
+        let living_room = make_device([1, 0, 0, 0, 0, 1], "Living Room");
+        let known = known(&[&living_room]);
+        let mut arbiter = Arbiter::default();
+        arbiter.handle_sink_event(&activity(&living_room, true));
+        arbiter.handle_sink_event(&activity(&living_room, false));
+        assert_eq!(arbiter.target(Some(&living_room.id), &known), None);
+    }
 
-        #[test]
-        fn switching_to_a_different_known_device_connects() {
-            let living_room = make_device([1, 0, 0, 0, 0, 1], "Living Room");
-            let bedroom = make_device([2, 0, 0, 0, 0, 2], "Bedroom");
-            let mut known = HashMap::new();
-            known.insert(living_room.id.clone(), living_room.clone());
-            known.insert(bedroom.id.clone(), bedroom.clone());
+    #[test]
+    fn unknown_device_is_never_a_target() {
+        let living_room = make_device([1, 0, 0, 0, 0, 1], "Living Room");
+        let mut arbiter = Arbiter::default();
+        arbiter.handle_sink_event(&activity(&living_room, true));
+        assert_eq!(arbiter.target(None, &HashMap::new()), None);
+    }
 
-            let cmd = derive_stream_command(
-                Some(&living_room.id),
-                &SinkEvent::DefaultSinkChanged(Some(bedroom.id.clone())),
-                &known,
-            );
-            assert_eq!(cmd, StreamCommand::ConnectTo(Box::new(bedroom)));
-        }
+    #[test]
+    fn yielded_device_stays_untargeted_until_playback_restarts() {
+        let living_room = make_device([1, 0, 0, 0, 0, 1], "Living Room");
+        let known = known(&[&living_room]);
+        let mut arbiter = Arbiter::default();
+        arbiter.handle_sink_event(&activity(&living_room, true));
+        arbiter.yield_device(&living_room.id);
+        assert_eq!(arbiter.target(Some(&living_room.id), &known), None);
 
-        #[test]
-        fn same_device_again_is_noop() {
-            let living_room = make_device([1, 0, 0, 0, 0, 1], "Living Room");
-            let mut known = HashMap::new();
-            known.insert(living_room.id.clone(), living_room.clone());
+        arbiter.handle_sink_event(&activity(&living_room, false));
+        arbiter.handle_sink_event(&activity(&living_room, true));
+        assert_eq!(arbiter.target(None, &known), Some(living_room.id.clone()));
+    }
 
-            let cmd = derive_stream_command(
-                Some(&living_room.id),
-                &SinkEvent::DefaultSinkChanged(Some(living_room.id.clone())),
-                &known,
-            );
-            assert_eq!(cmd, StreamCommand::NoOp);
-        }
+    #[test]
+    fn pressing_play_reclaims_yielded_device_while_still_playing() {
+        let living_room = make_device([1, 0, 0, 0, 0, 1], "Living Room");
+        let known = known(&[&living_room]);
+        let mut arbiter = Arbiter::default();
+        arbiter.handle_sink_event(&activity(&living_room, true));
+        arbiter.yield_device(&living_room.id);
+        assert_eq!(arbiter.target(None, &known), None);
 
-        #[test]
-        fn unknown_device_id_with_no_active_is_noop() {
-            let known = HashMap::new();
-            let unknown_id = DeviceId([9, 9, 9, 9, 9, 9]);
-            let cmd = derive_stream_command(
-                None,
-                &SinkEvent::DefaultSinkChanged(Some(unknown_id)),
-                &known,
-            );
-            assert_eq!(cmd, StreamCommand::NoOp);
-        }
+        arbiter.handle_sink_event(&SinkEvent::PlaybackStarted { id: living_room.id.clone() });
+        assert_eq!(arbiter.target(None, &known), Some(living_room.id.clone()));
+    }
 
-        #[test]
-        fn unknown_device_id_while_active_disconnects() {
-            let living_room = make_device([1, 0, 0, 0, 0, 1], "Living Room");
-            let known = HashMap::new(); // living_room not registered here
-            let unknown_id = DeviceId([9, 9, 9, 9, 9, 9]);
+    #[test]
+    fn volume_changes_dont_affect_target() {
+        let living_room = make_device([1, 0, 0, 0, 0, 1], "Living Room");
+        let known = known(&[&living_room]);
+        let mut arbiter = Arbiter::default();
+        arbiter.handle_sink_event(&SinkEvent::VolumeChanged { id: living_room.id.clone(), volume: 0.5 });
+        assert_eq!(arbiter.target(None, &known), None);
+    }
 
-            let cmd = derive_stream_command(
-                Some(&living_room.id),
-                &SinkEvent::DefaultSinkChanged(Some(unknown_id)),
-                &known,
-            );
-            assert_eq!(cmd, StreamCommand::Disconnect);
-        }
+    #[test]
+    fn sticks_with_current_while_another_starts() {
+        let living_room = make_device([1, 0, 0, 0, 0, 1], "Living Room");
+        let bedroom = make_device([2, 0, 0, 0, 0, 2], "Bedroom");
+        let known = known(&[&living_room, &bedroom]);
+        let mut arbiter = Arbiter::default();
+        arbiter.handle_sink_event(&activity(&bedroom, true));
+        arbiter.handle_sink_event(&activity(&living_room, true));
+        assert_eq!(
+            arbiter.target(Some(&living_room.id), &known),
+            Some(living_room.id.clone())
+        );
+        assert_eq!(arbiter.target(None, &known), Some(bedroom.id.clone()));
+    }
+
+    #[test]
+    fn falls_back_to_other_playing_device() {
+        let living_room = make_device([1, 0, 0, 0, 0, 1], "Living Room");
+        let bedroom = make_device([2, 0, 0, 0, 0, 2], "Bedroom");
+        let known = known(&[&living_room, &bedroom]);
+        let mut arbiter = Arbiter::default();
+        arbiter.handle_sink_event(&activity(&living_room, true));
+        arbiter.handle_sink_event(&activity(&bedroom, true));
+        arbiter.handle_sink_event(&activity(&living_room, false));
+        assert_eq!(
+            arbiter.target(Some(&living_room.id), &known),
+            Some(bedroom.id.clone())
+        );
+    }
+
+    #[test]
+    fn removed_device_is_forgotten() {
+        let living_room = make_device([1, 0, 0, 0, 0, 1], "Living Room");
+        let known = known(&[&living_room]);
+        let mut arbiter = Arbiter::default();
+        arbiter.handle_sink_event(&activity(&living_room, true));
+        arbiter.device_removed(&living_room.id);
+        assert_eq!(arbiter.target(None, &known), None);
     }
 }

@@ -937,6 +937,34 @@ impl Connection {
         self.volume
     }
 
+    /// Ask the receiver for its current volume (0.0 to 1.0). Not every
+    /// receiver answers this; callers should treat an error as "unknown".
+    pub async fn get_volume(&mut self) -> Result<f32> {
+        let req = RtspRequest::get_parameter_text(self.session.request_uri(), b"volume\r\n".to_vec());
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(2), self.rtsp.send(req))
+            .await
+            .map_err(|_| CoreError::Rtsp(RtspError::InvalidResponse("GET_PARAMETER volume timed out".into())))??;
+        if !resp.is_success() {
+            return Err(CoreError::Rtsp(RtspError::InvalidResponse(format!(
+                "GET_PARAMETER volume returned {} {}",
+                resp.status_code, resp.status_text
+            ))));
+        }
+        let body = resp.body.unwrap_or_default();
+        RtspSession::parse_volume_response(&body).ok_or_else(|| {
+            CoreError::Rtsp(RtspError::InvalidResponse(format!(
+                "no volume in GET_PARAMETER response: {:?}",
+                String::from_utf8_lossy(&body)
+            )))
+        })
+    }
+
+    /// Set the volume (0.0 to 1.0) sent when streaming starts, without
+    /// sending anything now. Defaults to 1.0.
+    pub fn set_initial_volume(&mut self, volume: f32) {
+        self.volume = volume.clamp(0.0, 1.0);
+    }
+
     /// Start audio streaming from a decoder source.
     pub async fn start_streaming(&mut self, decoder: AudioDecoder) -> Result<()> {
         // Ensure setup is complete

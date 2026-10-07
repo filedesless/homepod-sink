@@ -111,30 +111,6 @@ pub fn unique_node_name(existing: &HashMap<DeviceId, SinkEntry>, desired: &str) 
     }
 }
 
-/// Parse PipeWire's `default.audio.sink` metadata value, which is a JSON
-/// object like `{"name":"<node.name>"}`, into the node name it names.
-/// Returns None for malformed JSON or a missing/non-string `name` field -
-/// callers should log and treat this the same as "no default" rather than
-/// crash, since this value is produced by PipeWire/other clients, not us.
-pub fn parse_default_sink_node_name(value: &str) -> Option<String> {
-    let parsed: serde_json::Value = serde_json::from_str(value).ok()?;
-    parsed.get("name")?.as_str().map(|s| s.to_string())
-}
-
-/// Resolve a `default.audio.sink` node name back to one of our own
-/// devices, by matching against each SinkEntry's node_name. None means the
-/// name doesn't belong to any sink we created (the user picked some other
-/// output, or the value was malformed).
-pub fn resolve_node_name_to_device_id(
-    existing: &HashMap<DeviceId, SinkEntry>,
-    node_name: &str,
-) -> Option<DeviceId> {
-    existing
-        .iter()
-        .find(|(_, entry)| entry.node_name == node_name)
-        .map(|(id, _)| id.clone())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,82 +305,6 @@ mod tests {
             existing.insert(d2.id.clone(), entry(d2, "Bedroom (2)"));
 
             assert_eq!(unique_node_name(&existing, "Bedroom"), "Bedroom");
-        }
-    }
-
-    mod parse_default_sink_node_name {
-        use super::*;
-
-        #[test]
-        fn parses_well_formed_value() {
-            let value = r#"{"name":"Living Room"}"#;
-            assert_eq!(
-                parse_default_sink_node_name(value),
-                Some("Living Room".to_string())
-            );
-        }
-
-        #[test]
-        fn parses_value_with_extra_fields() {
-            let value = r#"{"name":"Bedroom","other":"ignored"}"#;
-            assert_eq!(
-                parse_default_sink_node_name(value),
-                Some("Bedroom".to_string())
-            );
-        }
-
-        #[test]
-        fn returns_none_for_malformed_json() {
-            assert_eq!(parse_default_sink_node_name("not json"), None);
-        }
-
-        #[test]
-        fn returns_none_for_missing_name_field() {
-            assert_eq!(parse_default_sink_node_name(r#"{"other":"x"}"#), None);
-        }
-
-        #[test]
-        fn returns_none_for_non_string_name_field() {
-            assert_eq!(parse_default_sink_node_name(r#"{"name":42}"#), None);
-        }
-    }
-
-    mod resolve_node_name_to_device_id {
-        use super::*;
-
-        #[test]
-        fn finds_matching_device() {
-            let device = make_device([1, 0, 0, 0, 0, 1], "Living Room");
-            let mut existing = HashMap::new();
-            existing.insert(device.id.clone(), entry(device.clone(), "Living Room"));
-
-            assert_eq!(
-                resolve_node_name_to_device_id(&existing, "Living Room"),
-                Some(device.id)
-            );
-        }
-
-        #[test]
-        fn returns_none_for_unknown_node_name() {
-            let device = make_device([1, 0, 0, 0, 0, 1], "Living Room");
-            let mut existing = HashMap::new();
-            existing.insert(device.id.clone(), entry(device, "Living Room"));
-
-            assert_eq!(
-                resolve_node_name_to_device_id(&existing, "Some Other Output"),
-                None
-            );
-        }
-
-        #[test]
-        fn matches_correct_entry_among_several() {
-            let d1 = make_device([1, 0, 0, 0, 0, 1], "Living Room");
-            let d2 = make_device([2, 0, 0, 0, 0, 2], "Bedroom");
-            let mut existing = HashMap::new();
-            existing.insert(d1.id.clone(), entry(d1, "Living Room"));
-            existing.insert(d2.id.clone(), entry(d2.clone(), "Bedroom"));
-
-            assert_eq!(resolve_node_name_to_device_id(&existing, "Bedroom"), Some(d2.id));
         }
     }
 }

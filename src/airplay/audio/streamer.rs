@@ -48,7 +48,9 @@ fn set_realtime_priority() {
         if result == 0 {
             tracing::info!("Set real-time priority (SCHED_FIFO, priority 50)");
         } else {
-            tracing::warn!("Failed to set RT priority (need CAP_SYS_NICE or root): errno={}",
+            // Expected without CAP_SYS_NICE, which is no longer set up:
+            // RT priority made no measurable difference to RTP jitter.
+            tracing::debug!("Running without RT priority (no CAP_SYS_NICE): errno={}",
                 *libc::__errno_location());
         }
     }

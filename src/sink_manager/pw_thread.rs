@@ -1,8 +1,8 @@
 //! The PipeWire mainloop thread: owns one virtual sink per discovered
-//! AirPlay device, watches PipeWire's `default.audio.sink` metadata, and
-//! forwards captured PCM for whichever sink is currently active.
+//! AirPlay device, reports when each one starts or stops receiving audible
+//! audio, and forwards captured PCM for whichever sink is currently active.
 //!
-//! Everything PipeWire-owned (streams, listeners, timers, the registry)
+//! Everything PipeWire-owned (streams, listeners, timers)
 //! lives entirely on this one dedicated OS thread and never crosses to
 //! another thread - `pw::loop_::Loop`'s event/timer/io sources all borrow
 //! the loop and are not `Send`. Commands arrive from the async side over a
@@ -13,8 +13,9 @@
 
 use std::collections::HashMap;
 use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use pipewire as pw;
 use pw::{properties::properties, spa};
@@ -26,9 +27,7 @@ use crate::airplay::audio::{LiveFrameSender, LivePcmFrame};
 use crate::airplay::core::device::DeviceId;
 
 use super::commands::{PwCommand, SinkEvent};
-use super::registry::{
-    self, SinkAction, SinkEntry,
-};
+use super::registry::{self, SinkAction, SinkEntry};
 
 /// Shared between every sink's process() callback: which device (if any)
 /// is currently active, and the channel to forward its PCM through.
@@ -41,6 +40,46 @@ use super::registry::{
 /// safely single-threaded on the PW mainloop thread, this one specific
 /// value cannot assume that, and needs real synchronization.
 pub type ActiveTarget = Arc<RwLock<Option<(DeviceId, LiveFrameSender)>>>;
+
+/// A sample louder than this (out of i16::MAX) counts as audio actually
+/// playing. Not zero, so dither or a filter chain's noise floor on an
+/// otherwise-paused stream doesn't keep a sink "playing" forever.
+const AUDIBLE_THRESHOLD: i16 = 4;
+
+/// How long a sink must stay below AUDIBLE_THRESHOLD before it counts as
+/// stopped even though a stream feeding it is still running - for apps
+/// that keep a stream open while silent (e.g. a browser tab). Long enough
+/// to ride out quiet passages and gaps between tracks.
+const IDLE_AFTER: Duration = Duration::from_secs(10);
+
+/// How long after the last stream feeding a sink stops running (e.g.
+/// Spotify was paused) the sink counts as stopped, which releases the
+/// AirPlay connection. Short, since pausing is unambiguous; just enough
+/// that a quick pause/play doesn't cost a reconnect.
+const RELEASE_AFTER: Duration = Duration::from_secs(3);
+
+/// What's connected to what in the PipeWire graph, and which nodes are
+/// running - enough to tell whether any stream feeding a sink is playing
+/// (as opposed to paused/corked, which stops it running).
+#[derive(Default)]
+struct Graph {
+    /// Link id -> (output node id, input node id).
+    links: HashMap<u32, (u32, u32)>,
+    /// Node id -> whether that node is currently running.
+    running: HashMap<u32, bool>,
+}
+
+impl Graph {
+    fn has_running_input(&self, node_id: u32) -> bool {
+        self.links
+            .values()
+            .any(|(output, input)| *input == node_id && self.running.get(output) == Some(&true))
+    }
+}
+
+use spa::sys::{
+    SPA_PROP_channelVolumes, SPA_PROP_mute, SPA_PROP_softMute, SPA_PROP_softVolumes,
+};
 
 /// A minimal self-pipe used purely to wake the PW thread's `add_io` source
 /// from another thread. `libc::eventfd` gives us a single fd that supports
@@ -110,18 +149,29 @@ impl PwWaker {
 unsafe impl Send for PwWaker {}
 unsafe impl Sync for PwWaker {}
 
-// Both fields exist only to be kept alive (never read again after
-// construction): the stream's Drop closes its PipeWire resources, and the
-// listener's Drop unregisters it. Dropping either early would tear the
-// sink down while it might still be needed.
+// The listener exists only to be kept alive (never read again after
+// construction): its Drop unregisters it, and the stream's Drop closes its
+// PipeWire resources. Dropping either early would tear the sink down while
+// it might still be needed.
 //
 // The per-sink driver timer is NOT stored here - see `timers` in `run()`
 // for why, and for the bug this split fixes (a leaked timer closure was
 // keeping every "destroyed" sink's stream alive forever).
-#[allow(dead_code)]
 struct LiveSink {
     stream: pw::stream::StreamRc,
+    #[allow(dead_code)]
     listener: pw::stream::StreamListener<()>,
+    /// Written by process(): milliseconds since `run()`'s `clock_start`
+    /// at which this sink last received an audible sample, 0 if never.
+    last_audible_ms: Arc<AtomicU64>,
+    /// The rest is only touched by the driver timer, on the PW mainloop
+    /// thread. Whether a stream feeding this sink was running last tick.
+    input_running: std::cell::Cell<bool>,
+    /// Milliseconds since `clock_start` at which a stream feeding this
+    /// sink was last seen running, 0 if never.
+    last_running_ms: std::cell::Cell<u64>,
+    /// Whether the last ActivityChanged sent for this sink said playing.
+    reported_playing: std::cell::Cell<bool>,
 }
 
 /// Runs on its own dedicated OS thread for the process's lifetime (or
@@ -144,6 +194,7 @@ pub fn run(
     let core = context.connect_rc(None)?;
 
     let active_target: ActiveTarget = Arc::new(RwLock::new(None));
+    let clock_start = Instant::now();
 
     let eventfd = EventFd::new()?;
     let waker = PwWaker {
@@ -157,7 +208,7 @@ pub fn run(
 
     // Registry of live sinks, kept in a local so it never needs to leave
     // this thread. Mirrors (but is not identical to) the async side's
-    // DeviceId -> Device map used for StreamCommand derivation - this one
+    // DeviceId -> Device map used for picking a target - this one
     // additionally tracks each sink's node_name and live PipeWire objects.
     // Rc<RefCell<_>> (not Mutex) because everything here runs
     // single-threaded on this one PW thread - the Rc lets both the add_io
@@ -170,96 +221,63 @@ pub fn run(
     let entries: std::cell::RefCell<HashMap<DeviceId, SinkEntry>> =
         std::cell::RefCell::new(HashMap::new());
 
+    // Track links and node run states, so the driver timer can tell when
+    // a stream feeding one of our sinks starts or stops playing. Every
+    // node is bound (there are only a few dozen on a desktop) since its
+    // run state only arrives through a bound proxy's info events.
+    let graph = std::rc::Rc::new(std::cell::RefCell::new(Graph::default()));
+    let bound_nodes: std::rc::Rc<
+        std::cell::RefCell<HashMap<u32, (pw::node::Node, pw::node::NodeListener)>>,
+    > = std::rc::Rc::new(std::cell::RefCell::new(HashMap::new()));
     let registry = core.get_registry_rc()?;
-
-    // Registry listener: look for the "default" metadata object (there can
-    // be other Metadata globals; only this one carries
-    // default.audio.sink/source) and bind + listen to it once found.
-    //
-    // Rc<RefCell<_>>, not Arc<RwLock<_>>: every closure here runs on this
-    // one PW thread only (PipeWire's local listeners are single-threaded
-    // callbacks, never invoked concurrently), and Metadata/MetadataListener
-    // are themselves !Send/!Sync (raw-pointer-backed), so Arc would be
-    // actively misleading about the actual thread-safety story.
-    let entries_for_metadata = std::rc::Rc::new(std::cell::RefCell::new(HashMap::<DeviceId, SinkEntry>::new()));
-    let sink_event_tx_for_metadata = sink_event_tx.clone();
-    let registry_for_bind = registry.clone();
-    let metadata_slot: std::rc::Rc<std::cell::RefCell<Option<pw::metadata::Metadata>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(None));
-    let metadata_listener_slot: std::rc::Rc<std::cell::RefCell<Option<pw::metadata::MetadataListener>>> =
-        std::rc::Rc::new(std::cell::RefCell::new(None));
-    let metadata_slot_for_cb = std::rc::Rc::clone(&metadata_slot);
-    let metadata_listener_slot_for_cb = std::rc::Rc::clone(&metadata_listener_slot);
-    let entries_for_metadata_cb = std::rc::Rc::clone(&entries_for_metadata);
-
     let _registry_listener = registry
         .add_listener_local()
-        .global(move |global| {
-            if global.type_ != pw::types::ObjectType::Metadata {
-                return;
-            }
-            let is_default_metadata = global
-                .props
-                .and_then(|p| p.get("metadata.name"))
-                .map(|name| name == "default")
-                .unwrap_or(false);
-            if !is_default_metadata {
-                return;
-            }
-            if metadata_slot_for_cb.borrow().is_some() {
-                // Already bound (shouldn't normally fire twice, but guard anyway).
-                return;
-            }
-
-            let bound: Result<pw::metadata::Metadata, _> = registry_for_bind.bind(global);
-            let bound = match bound {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!("failed to bind default metadata object: {}", e);
-                    return;
-                }
-            };
-
-            let entries_for_prop = std::rc::Rc::clone(&entries_for_metadata_cb);
-            let tx = sink_event_tx_for_metadata.clone();
-            let listener = bound
-                .add_listener_local()
-                .property(move |_subject, key, _type, value| {
-                    if key != Some("default.audio.sink") {
-                        return 0;
-                    }
-                    let resolved = match value {
-                        None => None,
-                        Some(v) => match registry::parse_default_sink_node_name(v) {
-                            Some(node_name) => {
-                                let entries = entries_for_prop.borrow();
-                                let id = registry::resolve_node_name_to_device_id(
-                                    &entries, &node_name,
-                                );
-                                if id.is_none() {
-                                    debug!(
-                                        "default.audio.sink is \"{}\", not one of ours",
-                                        node_name
-                                    );
-                                }
-                                id
-                            }
-                            None => {
-                                warn!("malformed default.audio.sink metadata value: {:?}", v);
-                                None
-                            }
-                        },
+        .global({
+            let registry = registry.clone();
+            let graph = std::rc::Rc::clone(&graph);
+            let bound_nodes = std::rc::Rc::clone(&bound_nodes);
+            move |global| match global.type_ {
+                pw::types::ObjectType::Link => {
+                    let node_prop = |key| {
+                        global.props.and_then(|p| p.get(key)).and_then(|v| v.parse::<u32>().ok())
                     };
-                    if let Err(e) = tx.send(SinkEvent::DefaultSinkChanged(resolved)) {
-                        warn!("failed to send SinkEvent: {}", e);
+                    if let (Some(output), Some(input)) =
+                        (node_prop("link.output.node"), node_prop("link.input.node"))
+                    {
+                        graph.borrow_mut().links.insert(global.id, (output, input));
                     }
-                    0
-                })
-                .register();
-
-            *metadata_slot_for_cb.borrow_mut() = Some(bound);
-            *metadata_listener_slot_for_cb.borrow_mut() = Some(listener);
-            info!("bound PipeWire default metadata, watching default.audio.sink");
+                }
+                pw::types::ObjectType::Node => {
+                    let node: pw::node::Node = match registry.bind(global) {
+                        Ok(node) => node,
+                        Err(e) => {
+                            debug!("failed to bind node {}: {}", global.id, e);
+                            return;
+                        }
+                    };
+                    let id = global.id;
+                    let graph = std::rc::Rc::clone(&graph);
+                    let listener = node
+                        .add_listener_local()
+                        .info(move |info| {
+                            let running = matches!(info.state(), pw::node::NodeState::Running);
+                            graph.borrow_mut().running.insert(id, running);
+                        })
+                        .register();
+                    bound_nodes.borrow_mut().insert(id, (node, listener));
+                }
+                _ => {}
+            }
+        })
+        .global_remove({
+            let graph = std::rc::Rc::clone(&graph);
+            let bound_nodes = std::rc::Rc::clone(&bound_nodes);
+            move |id| {
+                let mut graph = graph.borrow_mut();
+                graph.links.remove(&id);
+                graph.running.remove(&id);
+                bound_nodes.borrow_mut().remove(&id);
+            }
         })
         .register();
 
@@ -274,6 +292,7 @@ pub fn run(
     let _io_source = mainloop.loop_().add_io(eventfd, spa::support::system::IoFlags::IN, {
         let core = core.clone();
         let sinks = std::rc::Rc::clone(&sinks);
+        let sink_event_tx = sink_event_tx.clone();
         move |eventfd: &mut EventFd| {
             eventfd.drain();
             while let Ok(cmd) = cmd_rx.try_recv() {
@@ -284,13 +303,19 @@ pub fn run(
                             &mut sinks.borrow_mut(),
                             &mut entries.borrow_mut(),
                             &active_target,
+                            clock_start,
                             sample_rate,
+                            &sink_event_tx,
                             &event,
                         );
-                        *entries_for_metadata.borrow_mut() = entries.borrow().clone();
                     }
                     PwCommand::SetActiveTarget(target) => {
                         *active_target.write().unwrap() = target;
+                    }
+                    PwCommand::SetSinkVolume { id, volume } => {
+                        if let Some(live_sink) = sinks.borrow().get(&id) {
+                            set_sink_volume(&live_sink.stream, volume);
+                        }
                     }
                     PwCommand::Shutdown => {
                         mainloop_for_io.quit();
@@ -310,11 +335,48 @@ pub fn run(
     // `sinks`. A destroyed sink just stops being in that iteration from
     // the next tick onward; nothing needs to be armed/disarmed per sink.
     let period = Duration::from_secs_f64(1024.0 / sample_rate as f64);
+    //
+    // The same tick also turns each sink's input streams' run state and
+    // last-audible timestamp into SinkEvents - done here rather than in
+    // process() because process() may run on the realtime data thread and
+    // must not touch the (allocating) tokio channel.
+    //
+    // A sink is playing while a stream feeding it is running (or stopped
+    // less than RELEASE_AFTER ago) AND it has heard audio within
+    // IDLE_AFTER. A stream going from stopped to running is a deliberate
+    // play press, reported separately as PlaybackStarted.
     let sinks_for_timer = std::rc::Rc::clone(&sinks);
+    let graph_for_timer = std::rc::Rc::clone(&graph);
     let _driver_timer = mainloop.loop_().add_timer(move |_expirations| {
-        for live_sink in sinks_for_timer.borrow().values() {
+        let now_ms = clock_start.elapsed().as_millis() as u64;
+        let within = |ms: u64, window: Duration| {
+            ms != 0 && now_ms.saturating_sub(ms) < window.as_millis() as u64
+        };
+        let graph = graph_for_timer.borrow();
+        let send = |event: SinkEvent| {
+            if let Err(e) = sink_event_tx.send(event) {
+                warn!("failed to send SinkEvent: {}", e);
+            }
+        };
+        for (id, live_sink) in sinks_for_timer.borrow().iter() {
             if let Err(e) = live_sink.stream.trigger_process() {
                 debug!("trigger_process failed (sink likely mid-teardown): {}", e);
+            }
+
+            let input_running = graph.has_running_input(live_sink.stream.node_id());
+            if input_running {
+                if !live_sink.input_running.get() {
+                    send(SinkEvent::PlaybackStarted { id: id.clone() });
+                }
+                live_sink.last_running_ms.set(now_ms.max(1));
+            }
+            live_sink.input_running.set(input_running);
+
+            let playing = within(live_sink.last_running_ms.get(), RELEASE_AFTER)
+                && within(live_sink.last_audible_ms.load(Ordering::Relaxed), IDLE_AFTER);
+            if playing != live_sink.reported_playing.get() {
+                live_sink.reported_playing.set(playing);
+                send(SinkEvent::ActivityChanged { id: id.clone(), playing });
             }
         }
     });
@@ -325,24 +387,34 @@ pub fn run(
     info!("PipeWire sink manager thread running");
     mainloop.run();
 
-    // metadata_slot/metadata_listener_slot and every LiveSink's stream drop
-    // here, after mainloop.run() returns (on Shutdown), which is the
+    // Every LiveSink's stream drops here, after mainloop.run() returns (on Shutdown), which is the
     // correct point to release PipeWire resources.
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_browse_event(
     core: &pw::core::CoreRc,
     sinks: &mut HashMap<DeviceId, LiveSink>,
     entries: &mut HashMap<DeviceId, SinkEntry>,
     active_target: &ActiveTarget,
+    clock_start: Instant,
     sample_rate: u32,
+    sink_event_tx: &UnboundedSender<SinkEvent>,
     event: &crate::airplay::discovery::BrowseEvent,
 ) {
     let action = registry::plan_sink_action(entries, event);
     match action {
         SinkAction::Create { device, node_name } => {
-            match create_sink(core, &device.id, &node_name, sample_rate, active_target) {
+            match create_sink(
+                core,
+                &device.id,
+                &node_name,
+                clock_start,
+                sample_rate,
+                active_target,
+                sink_event_tx,
+            ) {
                 Ok(live_sink) => {
                     info!(
                         "created sink \"{}\" for device {} ({})",
@@ -396,12 +468,41 @@ fn handle_browse_event(
     }
 }
 
+/// Move a sink's volume slider, as if the user had: its control_info
+/// callback then reports the change like any other.
+fn set_sink_volume(stream: &pw::stream::StreamRc, volume: f32) {
+    // Slider position -> linear channel volume, the inverse of the cbrt in
+    // create_sink's control_info. Every sink is stereo.
+    let channel_volume = volume.clamp(0.0, 1.0).powi(3);
+    // Each set must be followed directly by re-pinning the soft control:
+    // unlike a change from outside (wpctl, a picker), one made by the
+    // stream itself turns PipeWire's software volume back on, and the
+    // re-pin in control_info doesn't undo it - measured on a test sink, a
+    // self-set 0.125 cut a 16000-peak tone to 2000 until this was added.
+    let result = stream
+        .set_control(SPA_PROP_channelVolumes, &[channel_volume; 2])
+        .and_then(|()| stream.set_control(SPA_PROP_softVolumes, &[1.0; 2]));
+    if let Err(e) = result {
+        warn!("failed to set sink volume: {}", e);
+    }
+    if volume > 0.0 {
+        let result = stream
+            .set_control(SPA_PROP_mute, &[0.0])
+            .and_then(|()| stream.set_control(SPA_PROP_softMute, &[0.0]));
+        if let Err(e) = result {
+            warn!("failed to unmute sink: {}", e);
+        }
+    }
+}
+
 fn create_sink(
     core: &pw::core::CoreRc,
     device_id: &DeviceId,
     node_name: &str,
+    clock_start: Instant,
     sample_rate: u32,
     active_target: &ActiveTarget,
+    sink_event_tx: &UnboundedSender<SinkEvent>,
 ) -> anyhow::Result<LiveSink> {
     let props = properties! {
         *pw::keys::MEDIA_TYPE => "Audio",
@@ -418,11 +519,67 @@ fn create_sink(
 
     let my_id = device_id.clone();
     let active_target = Arc::clone(active_target);
+    let last_audible_ms = Arc::new(AtomicU64::new(0));
+    let last_audible_for_process = Arc::clone(&last_audible_ms);
+    let sink_event_tx = sink_event_tx.clone();
+
+    // Last-seen PipeWire volume state, to turn control_info updates into
+    // one VolumeChanged event per actual change.
+    let volume_id = device_id.clone();
+    let mut channel_volume = 1.0_f32;
+    let mut muted = false;
+    let mut reported_volume: Option<f32> = None;
 
     let listener = stream
         .add_local_listener_with_user_data(())
         .state_changed(move |_stream, _data, old, new| {
             debug!("sink stream state: {:?} -> {:?}", old, new);
+        })
+        // The sink's volume and mute become the AirPlay device's own volume
+        // (see main.rs) - so PipeWire must not ALSO apply them to the PCM,
+        // or the audio would be attenuated twice. PipeWire's audioconvert
+        // scales by channelVolumes until the node sets softVolumes itself
+        // (as ALSA sinks with a hardware mixer do), so pin softVolumes and
+        // softMute to unity/unmuted whenever volume or mute change.
+        .control_info(move |stream, _data, id, control| {
+            // SAFETY: PipeWire passes a valid control for the duration of
+            // this callback, whose `values` holds `n_values` floats.
+            let values = unsafe {
+                let control = &*control;
+                if control.values.is_null() {
+                    &[][..]
+                } else {
+                    std::slice::from_raw_parts(control.values, control.n_values as usize)
+                }
+            };
+            debug!("sink {} control {} = {:?}", volume_id.to_mac_string(), id, values);
+            match id {
+                _ if id == SPA_PROP_channelVolumes && !values.is_empty() => {
+                    if let Err(e) = stream.set_control(SPA_PROP_softVolumes, &vec![1.0; values.len()]) {
+                        warn!("failed to bypass software volume: {}", e);
+                    }
+                    channel_volume = values.iter().copied().fold(0.0, f32::max);
+                }
+                _ if id == SPA_PROP_mute && !values.is_empty() => {
+                    if let Err(e) = stream.set_control(SPA_PROP_softMute, &[0.0]) {
+                        warn!("failed to bypass software mute: {}", e);
+                    }
+                    muted = values[0] > 0.5;
+                }
+                _ => return,
+            }
+
+            // channelVolumes are linear amplitude; the slider position
+            // users see (and AirPlay's dB scale is laid over) is its cube
+            // root.
+            let volume = if muted { 0.0 } else { channel_volume.cbrt().min(1.0) };
+            if reported_volume != Some(volume) {
+                reported_volume = Some(volume);
+                let event = SinkEvent::VolumeChanged { id: volume_id.clone(), volume };
+                if let Err(e) = sink_event_tx.send(event) {
+                    warn!("failed to send SinkEvent: {}", e);
+                }
+            }
         })
         .process(move |stream, _data| {
             let Some(mut buffer) = stream.dequeue_buffer() else {
@@ -438,6 +595,15 @@ fn create_sink(
             };
             let valid = &slice[..valid_len.min(slice.len())];
 
+            let audible = valid.chunks_exact(2).any(|chunk| {
+                i16::from_le_bytes([chunk[0], chunk[1]]).saturating_abs() > AUDIBLE_THRESHOLD
+            });
+            if audible {
+                // max(1): 0 is reserved for "never audible".
+                let now_ms = (clock_start.elapsed().as_millis() as u64).max(1);
+                last_audible_for_process.store(now_ms, Ordering::Relaxed);
+            }
+
             // Only forward PCM if this sink is the currently-active
             // target; otherwise the buffer is still dequeued/recycled
             // above (keeping the sink alive and functional as a normal,
@@ -451,8 +617,8 @@ fn create_sink(
                     }
                     // try_send, never blocking send: this callback runs on
                     // the PW mainloop thread, which also has to service
-                    // every other sink's timer and the metadata/registry
-                    // listeners - it must never stall on AirPlay-side
+                    // every other sink's timer and the async side's
+                    // commands - it must never stall on AirPlay-side
                     // backpressure the way main.rs's dedicated stdin
                     // thread is allowed to.
                     sender.try_send(LivePcmFrame {
@@ -511,5 +677,12 @@ fn create_sink(
     // actually dropped its PipeWire node - confirmed live via repeated
     // mDNS churn leaving duplicate zombie sinks in `pactl` indefinitely.
 
-    Ok(LiveSink { stream, listener })
+    Ok(LiveSink {
+        stream,
+        listener,
+        last_audible_ms,
+        input_running: std::cell::Cell::new(false),
+        last_running_ms: std::cell::Cell::new(0),
+        reported_playing: std::cell::Cell::new(false),
+    })
 }

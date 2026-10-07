@@ -9,12 +9,14 @@ use homepod_sink::airplay::client::AirPlayClient;
 use homepod_sink::airplay::core::device::{Device, DeviceId};
 use homepod_sink::airplay::core::{AudioCodec, StreamConfig};
 use homepod_sink::airplay::discovery::{Discovery, ServiceBrowser};
-use homepod_sink::sink_manager::{SinkManager, StreamCommand, commands::derive_stream_command};
+use homepod_sink::airplay::discovery::BrowseEvent;
+use homepod_sink::sink_manager::{Arbiter, SinkEvent, SinkManager};
 
-/// A PipeWire virtual sink per discovered AirPlay 2 device, with the one
-/// currently selected as PipeWire's default output actually streaming to
-/// it. Device selection happens entirely through an ordinary audio output
-/// picker (e.g. Noctalia's) - there is no --ip/--name here.
+/// A PipeWire virtual sink per discovered AirPlay 2 device. Whichever sink
+/// is receiving audio - as the default output, or because a single app was
+/// routed to it - gets a live AirPlay connection. Device selection happens
+/// entirely through ordinary PipeWire routing (an output picker,
+/// pavucontrol, ...) - there is no --ip/--name here.
 #[derive(Parser, Debug)]
 struct Args {
     /// Sample rate for every virtual sink. Should match your PipeWire
@@ -42,106 +44,129 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run(args: Args) -> Result<()> {
-    let (sink_manager, mut sink_events) = SinkManager::spawn(args.sample_rate)
-        .context("failed to start PipeWire sink manager")?;
+/// Backoff bounds for reconnecting to a device that stopped responding.
+const MIN_RETRY_DELAY: Duration = Duration::from_secs(2);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 
-    let browser = ServiceBrowser::new().context("failed to start mDNS browser")?;
-    let mut browse_stream = browser.browse().await.context("failed to start discovery")?;
+type SinkEvents = tokio::sync::mpsc::UnboundedReceiver<SinkEvent>;
 
-    // Mirrors the PW thread's own registry, kept here so StreamCommand
-    // derivation (a plain DeviceId -> Device lookup) doesn't need to ask
-    // the PW thread and wait on a reply.
-    let mut known_devices: HashMap<DeviceId, Device> = HashMap::new();
-    let mut current_device: Option<Device> = None;
+/// Everything the daemon reacts to, besides the AirPlay connection itself.
+struct State<B> {
+    sink_manager: SinkManager,
+    sink_events: SinkEvents,
+    browse_stream: B,
+    /// Mirrors the PW thread's own registry, kept here so picking a target
+    /// (a plain DeviceId -> Device lookup) doesn't need to ask the PW
+    /// thread and wait on a reply.
+    known_devices: HashMap<DeviceId, Device>,
+    arbiter: Arbiter,
+    /// Each device's PipeWire sink volume (0.0-1.0 slider position), which
+    /// is applied as that device's AirPlay volume.
+    volumes: HashMap<DeviceId, f32>,
+}
 
-    tracing::info!("watching for AirPlay devices and PipeWire's default output...");
-
-    loop {
+impl<B: tokio_stream::Stream<Item = BrowseEvent> + Unpin> State<B> {
+    /// Wait for the next discovery or sink-activity event and apply it.
+    async fn next_event(&mut self) -> Result<()> {
         tokio::select! {
-            // A discovery event arrived - keep our own Device map current
-            // (for StreamCommand derivation) and let the PW thread manage
-            // the corresponding sink.
-            maybe_event = tokio_stream::StreamExt::next(&mut browse_stream) => {
+            maybe_event = tokio_stream::StreamExt::next(&mut self.browse_stream) => {
                 let Some(event) = maybe_event else {
                     anyhow::bail!("discovery stream ended unexpectedly");
                 };
-                use homepod_sink::airplay::discovery::BrowseEvent;
                 match &event {
                     BrowseEvent::Added(d) | BrowseEvent::Updated(d) => {
-                        known_devices.insert(d.id.clone(), d.clone());
+                        self.known_devices.insert(d.id.clone(), d.clone());
                     }
                     BrowseEvent::Removed(id) => {
-                        known_devices.remove(id);
+                        self.known_devices.remove(id);
+                        self.arbiter.device_removed(id);
+                        self.volumes.remove(id);
                     }
                 }
-                sink_manager.handle_browse_event(event);
+                self.sink_manager.handle_browse_event(event);
             }
 
-            // PipeWire's default sink changed - figure out whether that
-            // means a different AirPlay connection should be active.
-            maybe_sink_event = sink_events.recv() => {
+            maybe_sink_event = self.sink_events.recv() => {
                 let Some(sink_event) = maybe_sink_event else {
                     anyhow::bail!("PipeWire sink manager event channel closed unexpectedly");
                 };
-                let currently_active = current_device.as_ref().map(|d| &d.id);
-                tracing::debug!(
-                    "sink event: {:?}, currently_active={:?}, known_devices={:?}",
-                    sink_event,
-                    currently_active,
-                    known_devices.keys().collect::<Vec<_>>()
-                );
-                let command = derive_stream_command(currently_active, &sink_event, &known_devices);
-                match command {
-                    StreamCommand::NoOp => {}
-                    StreamCommand::Disconnect => {
-                        tracing::info!("no AirPlay device selected as default output, staying idle");
-                        current_device = None;
-                        sink_manager.set_active_target(None);
-                    }
-                    StreamCommand::ConnectTo(device) => {
-                        tracing::info!(
-                            "default output switched to {} - connecting",
-                            device.name
-                        );
-                        current_device = Some(*device);
-                    }
+                tracing::debug!("sink event: {:?}", sink_event);
+                if let SinkEvent::VolumeChanged { id, volume } = &sink_event {
+                    self.volumes.insert(id.clone(), *volume);
                 }
+                self.arbiter.handle_sink_event(&sink_event);
             }
         }
+        Ok(())
+    }
 
-        // Whenever a target is set (initial pick or a switch), (re)connect
-        // to it. This runs the whole discover-less connect+stream+feedback
-        // sequence and only returns once the connection is judged dead or
-        // interrupted by a new target arriving - see stream_to_target.
-        if let Some(device) = current_device.clone() {
-            tracing::info!("connecting to {} ({})...", device.name, device.addresses.first().map(|a| a.to_string()).unwrap_or_default());
+    fn target(&self, current: Option<&DeviceId>) -> Option<DeviceId> {
+        self.arbiter.target(current, &self.known_devices)
+    }
+}
 
-            let outcome = stream_to_target(
-                &device,
-                args.sample_rate,
-                &sink_manager,
-                &mut sink_events,
-                &mut browse_stream,
-                &mut known_devices,
-            )
-            .await;
+async fn run(args: Args) -> Result<()> {
+    let (sink_manager, sink_events) = SinkManager::spawn(args.sample_rate)
+        .context("failed to start PipeWire sink manager")?;
 
-            match outcome {
-                StreamOutcome::SwitchedTo(new_device) => {
-                    current_device = Some(new_device);
-                    // Loop back around immediately to connect to it.
+    let browser = ServiceBrowser::new().context("failed to start mDNS browser")?;
+    let browse_stream = browser.browse().await.context("failed to start discovery")?;
+
+    let mut state = State {
+        sink_manager,
+        sink_events,
+        browse_stream,
+        known_devices: HashMap::new(),
+        arbiter: Arbiter::default(),
+        volumes: HashMap::new(),
+    };
+    let mut retry_delay = MIN_RETRY_DELAY;
+
+    tracing::info!("watching for AirPlay devices and audio routed to their sinks...");
+
+    loop {
+        let Some(id) = state.target(None) else {
+            state.next_event().await?;
+            continue;
+        };
+        let device = state.known_devices[&id].clone();
+        tracing::info!(
+            "audio playing to {} - connecting ({})...",
+            device.name,
+            device.addresses.first().map(|a| a.to_string()).unwrap_or_default()
+        );
+
+        match stream_to_target(&device, args.sample_rate, &mut state, &mut retry_delay).await? {
+            StreamOutcome::Retarget => {}
+            StreamOutcome::ConnectionLost(err) => {
+                tracing::warn!("connection to {} lost: {:#}", device.name, err);
+
+                // A HomePod that still answers on its control port but
+                // dropped our session was taken over by another sender
+                // (e.g. an iPhone). Reconnecting would steal it straight
+                // back, so leave it alone until playback here restarts.
+                if is_reachable(&device).await {
+                    tracing::info!(
+                        "{} is still reachable, so another AirPlay sender took it over - \
+                         not reconnecting until play is pressed again here",
+                        device.name
+                    );
+                    state.arbiter.yield_device(&device.id);
+                    retry_delay = MIN_RETRY_DELAY;
                     continue;
                 }
-                StreamOutcome::Disconnected => {
-                    current_device = None;
-                }
-                StreamOutcome::ConnectionLost(err) => {
-                    tracing::warn!("connection to {} lost: {:#}", device.name, err);
-                    // Stay assigned to this device; the top-level loop's
-                    // next iteration will retry it after a short backoff,
-                    // unless a StreamCommand arrives first and preempts it.
-                    tokio::time::sleep(Duration::from_secs(2)).await;
+
+                // Otherwise it's gone (power, Wi-Fi, new DHCP address):
+                // retry with backoff, while still handling events so a
+                // stop or switch takes effect immediately.
+                tracing::info!("{} is unreachable, retrying in {:?}", device.name, retry_delay);
+                let deadline = tokio::time::Instant::now() + retry_delay;
+                retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
+                while state.target(Some(&device.id)) == Some(device.id.clone()) {
+                    match tokio::time::timeout_at(deadline, state.next_event()).await {
+                        Ok(result) => result?,
+                        Err(_elapsed) => break,
+                    }
                 }
             }
         }
@@ -149,60 +174,88 @@ async fn run(args: Args) -> Result<()> {
 }
 
 enum StreamOutcome {
-    /// A new StreamCommand::ConnectTo arrived while streaming - switch to it.
-    SwitchedTo(Device),
-    /// A StreamCommand::Disconnect arrived - stop, no target.
-    Disconnected,
-    /// The connection itself failed/died - same target should be retried.
+    /// What should be playing changed (audio stopped, or the device was
+    /// yielded/removed) - re-evaluate the target.
+    Retarget,
+    /// The connection itself failed/died.
     ConnectionLost(anyhow::Error),
 }
 
+/// Whether `device` accepts a TCP connection on its AirPlay control port.
+/// A bare connect, no RTSP - it doesn't disturb whoever is playing.
+async fn is_reachable(device: &Device) -> bool {
+    for addr in &device.addresses {
+        let connect = tokio::net::TcpStream::connect((*addr, AIRPLAY_PORT));
+        if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(3), connect).await {
+            return true;
+        }
+    }
+    false
+}
+
 /// Connect to `device` and stream to it until either the connection dies
-/// (feedback failures) or a new StreamCommand arrives (default sink
-/// changed again while this one was active). Keeps discovery and
-/// sink-manager event handling running throughout via nested `select!`.
-async fn stream_to_target(
+/// (feedback failures) or it stops being the target. Keeps discovery and
+/// sink-activity event handling running throughout. Errors only if one of
+/// those event sources itself ends.
+async fn stream_to_target<B: tokio_stream::Stream<Item = BrowseEvent> + Unpin>(
     device: &Device,
     sample_rate: u32,
-    sink_manager: &SinkManager,
-    sink_events: &mut tokio::sync::mpsc::UnboundedReceiver<homepod_sink::sink_manager::SinkEvent>,
-    browse_stream: &mut (impl tokio_stream::Stream<Item = homepod_sink::airplay::discovery::BrowseEvent> + Unpin),
-    known_devices: &mut HashMap<DeviceId, Device>,
-) -> StreamOutcome {
+    state: &mut State<B>,
+    retry_delay: &mut Duration,
+) -> Result<StreamOutcome> {
     let mut config = StreamConfig::realtime_ntp();
     if config.audio_format.codec == AudioCodec::Alac {
         match AlacEncoder::new(config.audio_format.clone()) {
             Ok(temp_encoder) => config.asc = Some(temp_encoder.magic_cookie()),
-            Err(e) => return StreamOutcome::ConnectionLost(e.into()),
+            Err(e) => return Ok(StreamOutcome::ConnectionLost(e.into())),
         }
     }
 
     let mut client = match AirPlayClient::with_config(config, None) {
         Ok(c) => c,
-        Err(e) => return StreamOutcome::ConnectionLost(e.into()),
+        Err(e) => return Ok(StreamOutcome::ConnectionLost(e.into())),
     };
 
     let mut device = device.clone();
     device.port = AIRPLAY_PORT;
 
     if let Err(e) = client.connect(&device).await {
-        return StreamOutcome::ConnectionLost(e.into());
+        return Ok(StreamOutcome::ConnectionLost(e.into()));
+    }
+
+    // Starting to stream always sends a volume, and the HomePod has one
+    // volume shared by every sender. Prefer the level it's already at (e.g.
+    // as last set from an iPhone) and move the sink's slider to match;
+    // fall back to the slider's level if it won't say. Never the client's
+    // default of 100%.
+    let mut sent_volume = match client.get_volume().await {
+        Ok(volume) => {
+            tracing::info!("{} is at {:.0}% volume, matching the sink to it", device.name, volume * 100.0);
+            state.volumes.insert(device.id.clone(), volume);
+            state.sink_manager.set_sink_volume(device.id.clone(), volume);
+            Some(volume)
+        }
+        Err(e) => {
+            tracing::info!("couldn't read {}'s volume ({}), using the sink's", device.name, e);
+            state.volumes.get(&device.id).copied()
+        }
+    };
+    if let Some(volume) = sent_volume {
+        if let Err(e) = client.set_initial_volume(volume) {
+            return Ok(StreamOutcome::ConnectionLost(e.into()));
+        }
     }
 
     let (sender, decoder) = LiveAudioDecoder::create_pair(sample_rate, 2, 64);
-    install_active_target(sink_manager, &device.id, sender);
+    install_active_target(&state.sink_manager, &device.id, sender);
 
     if let Err(e) = client.start_live_streaming_with_decoder(decoder).await {
-        sink_manager.set_active_target(None);
-        return StreamOutcome::ConnectionLost(e.into());
+        state.sink_manager.set_active_target(None);
+        return Ok(StreamOutcome::ConnectionLost(e.into()));
     }
 
     tracing::info!("streaming to {} at {}Hz stereo", device.name, sample_rate);
-
-    match client.set_volume(1.0).await {
-        Ok(()) => tracing::info!("set initial volume to 1.0"),
-        Err(e) => tracing::warn!("failed to set initial volume: {}", e),
-    }
+    *retry_delay = MIN_RETRY_DELAY;
 
     const MAX_CONSECUTIVE_FAILURES: u32 = 3;
     let mut consecutive_failures = 0u32;
@@ -223,40 +276,33 @@ async fn stream_to_target(
                             e
                         );
                         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-                            break StreamOutcome::ConnectionLost(anyhow::anyhow!(
+                            break Ok(StreamOutcome::ConnectionLost(anyhow::anyhow!(
                                 "feedback failed {} times in a row",
                                 consecutive_failures
-                            ));
+                            )));
                         }
                     }
                 }
             }
 
-            maybe_event = tokio_stream::StreamExt::next(browse_stream) => {
-                let Some(event) = maybe_event else {
-                    break StreamOutcome::ConnectionLost(anyhow::anyhow!("discovery stream ended unexpectedly"));
-                };
-                use homepod_sink::airplay::discovery::BrowseEvent;
-                match &event {
-                    BrowseEvent::Added(d) | BrowseEvent::Updated(d) => {
-                        known_devices.insert(d.id.clone(), d.clone());
-                    }
-                    BrowseEvent::Removed(id) => {
-                        known_devices.remove(id);
-                    }
+            event_result = state.next_event() => {
+                if let Err(e) = event_result {
+                    break Err(e);
                 }
-                sink_manager.handle_browse_event(event);
-            }
-
-            maybe_sink_event = sink_events.recv() => {
-                let Some(sink_event) = maybe_sink_event else {
-                    break StreamOutcome::ConnectionLost(anyhow::anyhow!("PipeWire sink manager event channel closed unexpectedly"));
-                };
-                let command = derive_stream_command(Some(&device.id), &sink_event, known_devices);
-                match command {
-                    StreamCommand::NoOp => {}
-                    StreamCommand::Disconnect => break StreamOutcome::Disconnected,
-                    StreamCommand::ConnectTo(new_device) => break StreamOutcome::SwitchedTo(*new_device),
+                if state.target(Some(&device.id)) != Some(device.id.clone()) {
+                    tracing::info!("audio to {} stopped - disconnecting", device.name);
+                    break Ok(StreamOutcome::Retarget);
+                }
+                let volume = state.volumes.get(&device.id).copied();
+                // Tolerance: a slider move we made ourselves (above) echoes
+                // back through PipeWire with float rounding.
+                let changed = |v: &f32| sent_volume.is_none_or(|sent| (v - sent).abs() > 0.005);
+                if let Some(volume) = volume.filter(changed) {
+                    sent_volume = Some(volume);
+                    match client.set_volume(volume).await {
+                        Ok(()) => tracing::info!("set {} volume to {:.0}%", device.name, volume * 100.0),
+                        Err(e) => tracing::warn!("failed to set volume: {}", e),
+                    }
                 }
             }
         }
@@ -264,8 +310,9 @@ async fn stream_to_target(
 
     // Clear the PCM target immediately so the (now-former) active sink
     // goes quiet right away, then gracefully tear down the RTSP session
-    // (sends TEARDOWN) rather than just dropping the socket.
-    sink_manager.set_active_target(None);
+    // (sends TEARDOWN) rather than just dropping the socket - which also
+    // frees the speaker for other senders.
+    state.sink_manager.set_active_target(None);
     let _ = client.disconnect().await;
 
     result

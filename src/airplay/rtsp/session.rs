@@ -507,16 +507,33 @@ impl RtspSession {
 
     /// Build SET_PARAMETER request for volume.
     pub fn build_set_volume(&self, volume: f32) -> Result<Vec<u8>> {
-        // Volume is sent as text/parameters: "volume: -xx.xx"
-        // AirPlay uses a dB scale; use -144 for mute.
+        // Volume is sent as text/parameters: "volume: -xx.xx".
+        // AirPlay's range is -30 dB (quietest) to 0 dB (loudest), with
+        // -144 meaning mute; `volume` is a 0.0-1.0 slider position mapped
+        // linearly onto it, the same way iOS maps its own volume slider.
         let volume_db = if volume <= 0.0 {
             -144.0_f32 // Mute
-        } else if volume >= 1.0 {
-            0.0_f32 // Max volume
         } else {
-            20.0 * volume.log10()
+            -30.0 + 30.0 * volume.min(1.0)
         };
         Ok(format!("volume: {:.2}\r\n", volume_db).into_bytes())
+    }
+
+    /// Parse a GET_PARAMETER volume response body ("volume: -xx.xx") back
+    /// into the 0.0-1.0 slider position build_set_volume takes. None if the
+    /// body has no volume line.
+    pub fn parse_volume_response(body: &[u8]) -> Option<f32> {
+        let text = std::str::from_utf8(body).ok()?;
+        let volume_db: f32 = text
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("volume:"))?
+            .trim()
+            .parse()
+            .ok()?;
+        if volume_db <= -144.0 {
+            return Some(0.0); // Mute
+        }
+        Some(((volume_db + 30.0) / 30.0).clamp(0.0, 1.0))
     }
 
     /// Build SETPEERS request for multi-room.
@@ -1020,11 +1037,37 @@ mod tests {
 
             let data = session.build_set_volume(0.5).unwrap();
             let text = String::from_utf8(data).unwrap();
-            assert!(text.starts_with("volume: -")); // Should be negative dB
+            assert!(text.starts_with("volume: -15.00")); // Halfway through -30..0 dB
+
+            let data = session.build_set_volume(0.01).unwrap();
+            let text = String::from_utf8(data).unwrap();
+            assert!(text.starts_with("volume: -29.70")); // Quiet, but not muted
 
             let data = session.build_set_volume(0.0).unwrap();
             let text = String::from_utf8(data).unwrap();
             assert!(text.starts_with("volume: -144.00")); // Mute = -144 dB
+        }
+
+        #[test]
+        fn parse_volume_response_round_trips() {
+            let device = make_test_device();
+            let session = RtspSession::new(device, StreamConfig::default());
+
+            for volume in [0.0, 0.25, 0.5, 1.0] {
+                let body = session.build_set_volume(volume).unwrap();
+                let parsed = RtspSession::parse_volume_response(&body).unwrap();
+                assert!((parsed - volume).abs() < 0.001, "{volume} -> {parsed}");
+            }
+        }
+
+        #[test]
+        fn parse_volume_response_handles_odd_bodies() {
+            assert_eq!(RtspSession::parse_volume_response(b"volume: -11.000000\r\n").map(|v| (v * 1000.0).round()), Some(633.0));
+            assert_eq!(RtspSession::parse_volume_response(b"volume: 3.0\r\n"), Some(1.0));
+            assert_eq!(RtspSession::parse_volume_response(b"volume: -40.0\r\n"), Some(0.0));
+            assert_eq!(RtspSession::parse_volume_response(b""), None);
+            assert_eq!(RtspSession::parse_volume_response(b"progress: 1/2/3\r\n"), None);
+            assert_eq!(RtspSession::parse_volume_response(b"volume: loud\r\n"), None);
         }
 
         #[test]

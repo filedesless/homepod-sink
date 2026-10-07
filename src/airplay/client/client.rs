@@ -317,6 +317,25 @@ impl AirPlayClient {
         Ok(())
     }
 
+    /// Ask the receiver for its current volume (0.0 to 1.0). Not every
+    /// receiver answers this; treat an error as "unknown".
+    pub async fn get_volume(&mut self) -> Result<f32> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+        connection.get_volume().await
+    }
+
+    /// Set the volume (0.0 to 1.0) sent when streaming starts. Call after
+    /// connect() and before starting to stream; defaults to 1.0.
+    pub fn set_initial_volume(&mut self, volume: f32) -> Result<()> {
+        let connection = self.connection.as_mut().ok_or_else(|| {
+            Error::Rtsp(RtspError::NoSession)
+        })?;
+        connection.set_initial_volume(volume);
+        Ok(())
+    }
+
     /// Set volume (0.0 to 1.0).
     pub async fn set_volume(&mut self, volume: f32) -> Result<()> {
         let connection = self.connection.as_mut().ok_or_else(|| {

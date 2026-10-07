@@ -1,8 +1,8 @@
-//! Owns a PipeWire virtual sink per discovered AirPlay device, and tracks
-//! which one (if any) PipeWire's `default.audio.sink` currently names -
-//! that's the device Noctalia's (or any other) audio output picker has
-//! selected, and the only one whose captured PCM should be forwarded to a
-//! live AirPlay connection.
+//! Owns a PipeWire virtual sink per discovered AirPlay device, and reports
+//! when each one starts or stops receiving audio - whether because it's
+//! the default output or because a single app (e.g. Spotify) was routed
+//! to it. Only the active device's captured PCM is forwarded to a live
+//! AirPlay connection.
 
 pub mod commands;
 pub mod pw_thread;
@@ -14,7 +14,7 @@ use crate::airplay::audio::LiveFrameSender;
 use crate::airplay::core::device::DeviceId;
 use crate::airplay::discovery::BrowseEvent;
 
-pub use commands::{PwCommand, SinkEvent, StreamCommand};
+pub use commands::{Arbiter, PwCommand, SinkEvent};
 
 /// Handle for the async side to talk to the PipeWire mainloop thread.
 pub struct SinkManager {
@@ -24,8 +24,8 @@ pub struct SinkManager {
 
 impl SinkManager {
     /// Spawns the dedicated PipeWire mainloop thread and returns a handle
-    /// to it plus the channel on which `SinkEvent`s (currently just
-    /// default-sink changes) will arrive.
+    /// to it plus the channel on which `SinkEvent`s (sink activity
+    /// changes) will arrive.
     pub fn spawn(sample_rate: u32) -> anyhow::Result<(Self, UnboundedReceiver<SinkEvent>)> {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<PwCommand>();
         let (waker_tx, waker_rx) = std::sync::mpsc::channel();
@@ -67,6 +67,12 @@ impl SinkManager {
     /// device's sink should have its captured audio sent through `sender`.
     pub fn set_active_target(&self, target: Option<(DeviceId, LiveFrameSender)>) {
         let _ = self.cmd_tx.send(PwCommand::SetActiveTarget(target));
+        self.waker.wake();
+    }
+
+    /// Move a device's sink volume slider to `volume` (0.0-1.0).
+    pub fn set_sink_volume(&self, id: DeviceId, volume: f32) {
+        let _ = self.cmd_tx.send(PwCommand::SetSinkVolume { id, volume });
         self.waker.wake();
     }
 

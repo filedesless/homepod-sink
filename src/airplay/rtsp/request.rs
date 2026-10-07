@@ -151,6 +151,12 @@ impl RtspRequest {
             .body(body)
     }
 
+    pub fn get_parameter_text(uri: impl Into<String>, body: Vec<u8>) -> Self {
+        Self::new(RtspMethod::GetParameter, uri)
+            .header("Content-Type", "text/parameters")
+            .body(body)
+    }
+
     pub fn setpeers(_session_id: &str, body: Vec<u8>) -> Self {
         Self::new(RtspMethod::SetPeers, "/peer-list-changed")
             .content_type_bplist()

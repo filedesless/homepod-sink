@@ -105,8 +105,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     conn.setup().await?;
     println!("Setup complete!");
 
+    conn.set_initial_volume(volume);
     conn.start_streaming(decoder).await?;
-    conn.set_volume(volume).await?;
     println!("Playing... (volume={:.2})", volume);
 
     loop {
