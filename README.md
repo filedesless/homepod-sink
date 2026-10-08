@@ -65,10 +65,23 @@ is healthy, independent of everything else.
 
 ### Arch Linux
 
-A `PKGBUILD` is included, building straight from this repo (`homepod-sink-git`):
+A `PKGBUILD` is included in `arch/`, building straight from this repo's
+GitHub master (`homepod-sink-git`):
 
 ```sh
-makepkg -si
+cd arch && makepkg -si
+```
+
+It lives in a subdirectory because makepkg uses `src/` next to the PKGBUILD
+as its build directory, which would clobber the crate's own `src/`. To have
+paru track master instead, add the repo as a PKGBUILD repo in
+`~/.config/paru/paru.conf` (`GenerateSrcinfo` because `.SRCINFO` isn't
+committed) and run `paru -Sy --pkgbuilds && paru -S homepod-sink-git`:
+
+```ini
+[homepod-sink]
+Url = https://github.com/filedesless/homepod-sink
+GenerateSrcinfo
 ```
 
 This builds and installs both binaries to `/usr/lib/homepod-sink/`
