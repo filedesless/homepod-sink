@@ -1,6 +1,26 @@
+# These hooks run as root. They reach each logged-in or lingering user's
+# systemd --user manager through `systemctl --user -M <user>@`.
+
+_users() {
+    loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'
+}
+
+_userctl() {
+    user=$1
+    shift
+    systemctl --user -M "$user@" "$@"
+}
+
 post_install() {
-    echo "==> To run homepod-sink at login:"
-    echo "==>   systemctl --user enable --now homepod-sink"
+    for user in $(_users); do
+        _userctl "$user" daemon-reload 2>/dev/null
+        if _userctl "$user" enable --now homepod-sink 2>/dev/null; then
+            echo "==> Enabled and started homepod-sink.service for $user"
+        else
+            echo "==> Couldn't enable homepod-sink.service for $user, run:"
+            echo "==>   systemctl --user enable --now homepod-sink"
+        fi
+    done
     echo "==> homepod-sink creates a PipeWire virtual sink for every AirPlay 2"
     echo "==> device it finds on the network - pick which one to use from your"
     echo "==> system's audio output picker (e.g. Noctalia), same as any other"
@@ -8,11 +28,11 @@ post_install() {
 }
 
 post_upgrade() {
-    # Restart the service for every logged-in or lingering user it's running
-    # for, so it picks up the new binary.
-    for user in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
-        systemctl --user -M "$user@" is-active --quiet homepod-sink 2>/dev/null || continue
-        if systemctl --user -M "$user@" restart homepod-sink; then
+    # Restart wherever it's running, so it picks up the new binary.
+    for user in $(_users); do
+        _userctl "$user" daemon-reload 2>/dev/null
+        _userctl "$user" is-active --quiet homepod-sink 2>/dev/null || continue
+        if _userctl "$user" restart homepod-sink; then
             echo "==> Restarted homepod-sink.service for $user"
         else
             echo "==> Couldn't restart homepod-sink.service for $user, run:"
@@ -22,10 +42,16 @@ post_upgrade() {
 }
 
 pre_remove() {
-    # This runs as root with no reliable way to identify (or reach) the
-    # invoking user's systemd --user session, so it can't safely run
-    # `systemctl --user` itself - just tell the user to do it before the
-    # binary disappears out from under a still-running service.
-    echo "==> If homepod-sink.service is enabled/running, stop it first:"
-    echo "==>   systemctl --user disable --now homepod-sink"
+    # Stop it before the binary disappears out from under a running service.
+    for user in $(_users); do
+        _userctl "$user" is-enabled --quiet homepod-sink 2>/dev/null ||
+            _userctl "$user" is-active --quiet homepod-sink 2>/dev/null ||
+            continue
+        if _userctl "$user" disable --now homepod-sink; then
+            echo "==> Stopped and disabled homepod-sink.service for $user"
+        else
+            echo "==> Couldn't stop homepod-sink.service for $user, run:"
+            echo "==>   systemctl --user disable --now homepod-sink"
+        fi
+    done
 }

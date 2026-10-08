@@ -89,9 +89,9 @@ rm ~/.config/systemd/user/homepod-sink.service
 systemctl --user daemon-reload
 ```
 
-See
-[Running as a systemd service](#running-as-a-systemd-service) below to
-enable it. Uninstall with `sudo pacman -R homepod-sink-git`.
+Installing enables and starts the service for every logged-in user,
+upgrading restarts it wherever it's running, and uninstalling (`sudo pacman
+-R homepod-sink-git`) stops and disables it.
 
 ### From source
 
@@ -163,11 +163,11 @@ restarted.
 
 ## Running as a systemd service
 
-**If installed via the Arch package**, the unit is already at
-`/usr/lib/systemd/user/homepod-sink.service`:
+**If installed via the Arch package**, the unit is at
+`/usr/lib/systemd/user/homepod-sink.service` and the package enables it for
+every user logged in at install time. Anyone else enables it with:
 
 ```sh
-systemctl --user daemon-reload
 systemctl --user enable --now homepod-sink
 ```
 
