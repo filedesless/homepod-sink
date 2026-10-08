@@ -7,6 +7,20 @@ post_install() {
     echo "==> output device. Nothing to configure to select a target."
 }
 
+post_upgrade() {
+    # Restart the service for every logged-in or lingering user it's running
+    # for, so it picks up the new binary.
+    for user in $(loginctl list-users --no-legend 2>/dev/null | awk '{print $2}'); do
+        systemctl --user -M "$user@" is-active --quiet homepod-sink 2>/dev/null || continue
+        if systemctl --user -M "$user@" restart homepod-sink; then
+            echo "==> Restarted homepod-sink.service for $user"
+        else
+            echo "==> Couldn't restart homepod-sink.service for $user, run:"
+            echo "==>   systemctl --user restart homepod-sink"
+        fi
+    done
+}
+
 pre_remove() {
     # This runs as root with no reliable way to identify (or reach) the
     # invoking user's systemd --user session, so it can't safely run
