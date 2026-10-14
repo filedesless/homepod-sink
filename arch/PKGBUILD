@@ -23,10 +23,10 @@ if [[ -z $_manifest_pkgver || -z $_manifest_sha256_x86_64 || -z $_manifest_sha25
     _manifest_pkgver=r0.0000000 _manifest_sha256_x86_64=SKIP _manifest_sha256_aarch64=SKIP
 fi
 
-pkgname=homepod-sink-bin
+pkgname=homepod-sink-nightly
 pkgver=$_manifest_pkgver
 pkgrel=1
-pkgdesc="Turns a HomePod into a PipeWire audio output via AirPlay 2 (prebuilt)"
+pkgdesc="Turns a HomePod into a PipeWire audio output via AirPlay 2 (prebuilt from master)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/filedesless/homepod-sink"
 license=('GPL-3.0-or-later')

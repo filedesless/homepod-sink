@@ -65,7 +65,7 @@ is healthy, independent of everything else.
 
 ### Arch Linux
 
-`arch/PKGBUILD` builds `homepod-sink-bin`: **prebuilt** binaries from the
+`arch/PKGBUILD` builds `homepod-sink-nightly`: **prebuilt** binaries from the
 rolling [`latest` release](https://github.com/filedesless/homepod-sink/releases/tag/latest).
 CI (`.github/workflows/release.yml`) rebuilds it for x86_64 and aarch64 on
 every push to master, alongside a `manifest` with the version and
@@ -86,7 +86,7 @@ Url = https://github.com/filedesless/homepod-sink
 GenerateSrcinfo
 ```
 
-Then `paru -Sy --pkgbuilds && paru -S homepod-sink-bin`, and `paru -Syu`
+Then `paru -Sy --pkgbuilds && paru -S homepod-sink-nightly`, and `paru -Syu`
 picks up new builds from then on. To build from source instead, see
 [From source](#from-source) below.
 
@@ -110,7 +110,7 @@ systemctl --user daemon-reload
 
 Installing enables and starts the service for every logged-in user,
 upgrading restarts it wherever it's running, and uninstalling (`sudo pacman
--R homepod-sink-bin`) stops and disables it.
+-R homepod-sink-nightly`) stops and disables it.
 
 ### From source
 
