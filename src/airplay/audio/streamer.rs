@@ -509,6 +509,47 @@ struct StreamerInner {
     /// Tells the receiver to render audio this far in the future, giving more
     /// time for retransmit recovery of lost packets.
     render_delay_ns: u64,
+    /// (stream timestamp, local wall-clock ns) of the packet the current
+    /// timeline was anchored at. Every sync packet's NTP time is derived
+    /// from this rather than read from the clock when the packet happens to
+    /// be encoded - the encode loop's scheduling jitter (measured 0.3-4.3ms)
+    /// would otherwise make consecutive syncs disagree by a few ms, and the
+    /// receiver correcting to each one is audible as a stutter. None means
+    /// re-anchor on the next packet: after a gap in the stream (pause,
+    /// underrun, flush, seek) the timestamp stops advancing in step with
+    /// real time.
+    sync_anchor: Option<(u64, u64)>,
+}
+
+/// How far the anchored timeline may disagree with the actual clock before
+/// it is re-anchored. Far above the encode loop's jitter, so it only fires
+/// when the wall clock is stepped (CLOCK_REALTIME vs. the monotonic clock
+/// that paces packets) or the loop stalls badly.
+const MAX_ANCHOR_DRIFT_NS: u64 = 20_000_000;
+
+/// The local wall-clock time `packet_timestamp` plays at on the timeline
+/// anchored at `anchor`, and whether to re-anchor there instead (no anchor
+/// yet, or the timeline drifted more than MAX_ANCHOR_DRIFT_NS from
+/// `now_wall`), in which case the time is `now_wall` itself.
+fn anchored_wall_ns(
+    anchor: Option<(u64, u64)>,
+    packet_timestamp: u64,
+    now_wall: u64,
+    sample_rate: u32,
+) -> (u64, bool) {
+    let Some((anchor_ts, anchor_wall)) = anchor else {
+        return (now_wall, true);
+    };
+    let elapsed = packet_timestamp.saturating_sub(anchor_ts);
+    let wall = anchor_wall + elapsed * 1_000_000_000 / sample_rate as u64;
+    if wall.abs_diff(now_wall) > MAX_ANCHOR_DRIFT_NS {
+        tracing::warn!(
+            "Sync timeline is {:+.1}ms off the clock, re-anchoring",
+            (wall as i128 - now_wall as i128) as f64 / 1e6
+        );
+        return (now_wall, true);
+    }
+    (wall, false)
 }
 
 /// High-level audio streamer.
@@ -574,6 +615,7 @@ impl AudioStreamer {
                 spatial_snapshot: None,
                 first_packet_sent: false,
                 render_delay_ns: 0,
+                sync_anchor: None,
             })),
             task: None,
             state_cache: Arc::new(AtomicU8::new(StreamerState::Idle as u8)),
@@ -666,6 +708,16 @@ impl AudioStreamer {
     /// Handle retransmit request from control channel (delegates to first sender).
     pub async fn handle_retransmit(&self, request: &super::rtp::RetransmitRequest) -> crate::airplay::core::error::Result<u16> {
         self.handle_retransmit_for_target(0, request).await
+    }
+
+    /// Like `handle_retransmit`, also returning the sequence number the next
+    /// new packet will get - how far behind real time the request is.
+    pub async fn handle_retransmit_with_next_seq(&self, request: &super::rtp::RetransmitRequest) -> crate::airplay::core::error::Result<(u16, u16)> {
+        let inner = self.inner.lock().await;
+        match inner.rtp_senders.first() {
+            Some(sender) => Ok((sender.handle_retransmit(request)?, sender.sequence())),
+            None => Ok((0, 0)),
+        }
     }
 
     /// Handle retransmit request for a specific target device.
@@ -986,6 +1038,7 @@ impl AudioStreamer {
     pub async fn reset_after_flush(&mut self) {
         let mut inner = self.inner.lock().await;
         inner.first_packet_sent = false;
+        inner.sync_anchor = None;
         for sender in &mut inner.rtp_senders {
             sender.reset_sync_state();
         }
@@ -1047,6 +1100,7 @@ impl AudioStreamer {
             eq.reset();
         }
         inner.current_timestamp = position_samples;
+        inner.sync_anchor = None;
         self.timestamp_cache.store(position_samples, Ordering::Relaxed);
         Ok(())
     }
@@ -1157,6 +1211,7 @@ async fn run_streamer(
                 break;
             }
             if state == StreamerState::Paused {
+                inner.lock().await.sync_anchor = None;
                 sleep(Duration::from_millis(10)).await;
                 // Reset deadline after pause so we don't burst-send
                 next_deadline = Instant::now();
@@ -1334,8 +1389,14 @@ async fn run_streamer(
                 let sample_rate = guard.config.audio_format.sample_rate.as_hz();
                 let last_sync_rtp = guard.last_sync_rtp;
 
-                // Get current time and apply clock offset from PTP/NTP sync
-                let local_wall = guard.clock.now_wall_ns();
+                // This packet's place on the anchored timeline (see
+                // `sync_anchor`), then the clock offset from PTP/NTP sync.
+                let now_wall = guard.clock.now_wall_ns();
+                let (local_wall, reanchor) =
+                    anchored_wall_ns(guard.sync_anchor, packet_timestamp, now_wall, sample_rate);
+                if reanchor {
+                    guard.sync_anchor = Some((packet_timestamp, now_wall));
+                }
                 let adjusted = if let Some(offset) = guard.clock_offset {
                     let result = guard.clock.apply_offset(local_wall, &offset);
                     if diag < 3 {
@@ -1356,6 +1417,7 @@ async fn run_streamer(
                 };
 
                 // Apply render delay
+                // Apply render delay
                 let render_adjusted = adjusted + guard.render_delay_ns;
                 let ntp = unix_to_ntp(render_adjusted);
 
@@ -1368,8 +1430,10 @@ async fn run_streamer(
 
                 let rtp_ts = packet_timestamp as u32;
 
-                // Determine if sync is needed
-                let need_sync = first_packet || last_sync_rtp == 0
+                // Determine if sync is needed. A new anchor must reach the
+                // receiver right away, or it keeps placing packets on the
+                // old timeline until the next periodic sync.
+                let need_sync = first_packet || reanchor || last_sync_rtp == 0
                     || rtp_ts.wrapping_sub(last_sync_rtp) >= sample_rate;
 
                 if !guard.rtp_senders.is_empty() {
@@ -1504,6 +1568,7 @@ async fn run_streamer(
                     tracing::warn!("Buffer underrun #{} (buffer empty, packet skipped)", count);
                 }
                 guard.state = StreamerState::Buffering;
+                guard.sync_anchor = None;
                 state_cache.store(StreamerState::Buffering as u8, Ordering::Relaxed);
             }
         }
@@ -1544,6 +1609,34 @@ mod tests {
 
     fn test_config() -> StreamConfig {
         StreamConfig::default()
+    }
+
+    mod sync_anchor {
+        use super::*;
+
+        const T0: u64 = 1_800_000_000_000_000_000;
+
+        #[test]
+        fn anchors_first_packet_at_now() {
+            assert_eq!(anchored_wall_ns(None, 0, T0, 44100), (T0, true));
+        }
+
+        #[test]
+        fn ignores_encode_jitter() {
+            // One second of samples later, encoded 4ms late: the sync still
+            // lands exactly one second after the anchor.
+            let anchor = Some((0, T0));
+            let late = T0 + 1_000_000_000 + 4_000_000;
+            assert_eq!(anchored_wall_ns(anchor, 44100, late, 44100), (T0 + 1_000_000_000, false));
+        }
+
+        #[test]
+        fn reanchors_on_large_drift() {
+            // A wall-clock step (or long stall) moves past the tolerance.
+            let anchor = Some((0, T0));
+            let stepped = T0 + 1_000_000_000 + MAX_ANCHOR_DRIFT_NS + 1;
+            assert_eq!(anchored_wall_ns(anchor, 44100, stepped, 44100), (stepped, true));
+        }
     }
 
     mod state_machine {

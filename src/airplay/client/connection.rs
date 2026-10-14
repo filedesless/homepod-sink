@@ -1218,13 +1218,20 @@ impl Connection {
             let rt_handle = tokio::runtime::Handle::current();
             let stats = Arc::clone(&self.stream_stats);
             let stop_flag = Arc::clone(&self.control_stop);
+            let format = &self.stream_config.audio_format;
+            let packet_ms = format.frames_per_packet as f64 * 1000.0 / format.sample_rate.as_hz() as f64;
+            let render_delay_ms = self.render_delay_ms;
 
             Some(tokio::task::spawn_blocking(move || {
                 tracing::debug!("Control channel thread started for live streaming (5ms poll)");
+                let mut burst: Option<LossBurst> = None;
                 loop {
                     if stop_flag.load(Ordering::Acquire) {
                         tracing::info!("Control channel thread (live): stop flag set, exiting");
                         break;
+                    }
+                    if burst.as_ref().is_some_and(|b| b.last.elapsed() >= LOSS_BURST_GAP) {
+                        burst.take().unwrap().log();
                     }
                     match control_rx_clone.recv_raw_timeout(std::time::Duration::from_millis(5)) {
                         Ok(Some((data, _addr))) => {
@@ -1247,8 +1254,14 @@ impl Connection {
 
                                 if let Some(request) = request {
                                     stats.rtx_requested.fetch_add(request.count as u64, std::sync::atomic::Ordering::Relaxed);
-                                    match rt_handle.block_on(streamer_clone.handle_retransmit(&request)) {
-                                        Ok(retransmitted) => {
+                                    match rt_handle.block_on(streamer_clone.handle_retransmit_with_next_seq(&request)) {
+                                        Ok((retransmitted, next_seq)) => {
+                                            // The oldest packet asked for, in
+                                            // packets since it was sent.
+                                            let behind = next_seq.wrapping_sub(request.first_sequence);
+                                            burst
+                                                .get_or_insert_with(|| LossBurst::new(render_delay_ms))
+                                                .record(&request, retransmitted, behind as f64 * packet_ms);
                                             if retransmitted > 0 {
                                                 stats.rtx_fulfilled.fetch_add(retransmitted as u64, std::sync::atomic::Ordering::Relaxed);
                                                 tracing::debug!(
@@ -1588,6 +1601,82 @@ impl Connection {
     }
 }
 
+/// Retransmit requests further apart than this belong to separate loss bursts.
+const LOSS_BURST_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// One burst of packet loss as reported by the receiver's retransmit
+/// requests, summarized in a single log line once it ends - Wi-Fi loss comes
+/// in clusters of dozens of requests, too many to log one by one.
+struct LossBurst {
+    render_delay_ms: u32,
+    start: std::time::Instant,
+    last: std::time::Instant,
+    requested: u64,
+    /// Sequence numbers asked for more than once: the earlier retransmit
+    /// was lost too, or arrived too late.
+    repeated: u64,
+    /// Packets no longer in the history ring, so never retransmitted.
+    missing: u64,
+    /// Packets requested later than the render delay after being sent: the
+    /// resend arrives after its play time, so the gap is audible.
+    late: u64,
+    oldest_ms: f64,
+    seen: std::collections::HashSet<u16>,
+}
+
+impl LossBurst {
+    fn new(render_delay_ms: u32) -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            render_delay_ms,
+            start: now,
+            last: now,
+            requested: 0,
+            repeated: 0,
+            missing: 0,
+            late: 0,
+            oldest_ms: 0.0,
+            seen: std::collections::HashSet::new(),
+        }
+    }
+
+    /// `age_ms`: how long ago the request's first packet was sent.
+    fn record(&mut self, request: &crate::airplay::audio::RetransmitRequest, retransmitted: u16, age_ms: f64) {
+        let count = request.count as u64;
+        self.last = std::time::Instant::now();
+        self.requested += count;
+        self.missing += count.saturating_sub(retransmitted as u64);
+        if age_ms > self.render_delay_ms as f64 {
+            self.late += count;
+        }
+        for i in 0..request.count {
+            if !self.seen.insert(request.first_sequence.wrapping_add(i)) {
+                self.repeated += 1;
+            }
+        }
+        self.oldest_ms = self.oldest_ms.max(age_ms);
+    }
+
+    fn log(self) {
+        let summary = format!(
+            "{} packet(s) over {:.0}ms ({} repeated, {} no longer buffered), oldest requested {:.0}ms after sending",
+            self.requested,
+            self.last.duration_since(self.start).as_secs_f64() * 1000.0,
+            self.repeated,
+            self.missing,
+            self.oldest_ms,
+        );
+        if self.late > 0 || self.missing > 0 {
+            tracing::warn!(
+                "Network loss burst, likely audible ({} requested past the {}ms render delay): {}",
+                self.late, self.render_delay_ms, summary
+            );
+        } else {
+            tracing::info!("Network loss burst, recovered: {}", summary);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1596,6 +1685,26 @@ mod tests {
     // ============================================================================
     // Helper Function Tests
     // ============================================================================
+
+    mod loss_burst {
+        use super::*;
+        use crate::airplay::audio::RetransmitRequest;
+
+        #[test]
+        fn counts_repeats_late_and_missing() {
+            let mut burst = LossBurst::new(200);
+            // 3 packets, 74ms old, all resent: recoverable.
+            burst.record(&RetransmitRequest { first_sequence: 10, count: 3 }, 3, 74.0);
+            // Asked again for 2 of them, now past the render delay, and one
+            // already fell out of the history.
+            burst.record(&RetransmitRequest { first_sequence: 11, count: 2 }, 1, 241.0);
+            assert_eq!(burst.requested, 5);
+            assert_eq!(burst.repeated, 2);
+            assert_eq!(burst.late, 2);
+            assert_eq!(burst.missing, 1);
+            assert_eq!(burst.oldest_ms, 241.0);
+        }
+    }
 
     mod device_id_generation {
         use super::*;

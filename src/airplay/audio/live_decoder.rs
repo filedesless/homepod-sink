@@ -6,6 +6,8 @@
 
 use crate::airplay::core::{AudioFormat, error::Result};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use super::decoder::DecodedFrame;
@@ -24,6 +26,10 @@ pub struct LivePcmFrame {
 /// Sender for pushing live PCM frames to a LiveAudioDecoder.
 pub struct LiveFrameSender {
     tx: Sender<LivePcmFrame>,
+    /// Frames dropped because the channel was full. Only counted here -
+    /// try_send runs on PipeWire's realtime thread, which must not log -
+    /// and reported by the decoder side.
+    dropped: Arc<AtomicU64>,
 }
 
 impl LiveFrameSender {
@@ -34,7 +40,7 @@ impl LiveFrameSender {
         match self.tx.try_send(frame) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => {
-                tracing::debug!("Live audio channel full, dropping frame");
+                self.dropped.fetch_add(1, Ordering::Relaxed);
                 false
             }
             Err(TrySendError::Disconnected(_)) => {
@@ -66,6 +72,10 @@ impl LiveFrameSender {
 /// allowing live audio sources to be streamed over AirPlay.
 pub struct LiveAudioDecoder {
     rx: Receiver<LivePcmFrame>,
+    /// Shared with the sender: frames it dropped on a full channel.
+    dropped: Arc<AtomicU64>,
+    /// `dropped` as of the last report, to log only new drops.
+    reported_dropped: u64,
     sample_rate: u32,
     channels: u8,
     position_samples: u64,
@@ -87,6 +97,8 @@ impl LiveAudioDecoder {
     pub fn new(rx: Receiver<LivePcmFrame>, sample_rate: u32, channels: u8) -> Self {
         Self {
             rx,
+            dropped: Arc::new(AtomicU64::new(0)),
+            reported_dropped: 0,
             sample_rate,
             channels,
             position_samples: 0,
@@ -103,8 +115,8 @@ impl LiveAudioDecoder {
     /// Channel capacity controls buffering (typically 8-16 frames).
     pub fn create_pair(sample_rate: u32, channels: u8, capacity: usize) -> (LiveFrameSender, Self) {
         let (tx, rx) = bounded::<LivePcmFrame>(capacity);
-        let sender = LiveFrameSender { tx };
         let decoder = Self::new(rx, sample_rate, channels);
+        let sender = LiveFrameSender { tx, dropped: Arc::clone(&decoder.dropped) };
         (sender, decoder)
     }
 
@@ -150,6 +162,16 @@ impl LiveAudioDecoder {
     pub fn decode_frame(&mut self) -> Result<Option<DecodedFrame>> {
         if self.eof {
             return Ok(None);
+        }
+
+        let dropped = self.dropped.load(Ordering::Relaxed);
+        if dropped != self.reported_dropped {
+            tracing::warn!(
+                "Live audio channel full: dropped {} frame(s) ({} total)",
+                dropped - self.reported_dropped,
+                dropped
+            );
+            self.reported_dropped = dropped;
         }
 
         match self.rx.recv_timeout(self.recv_timeout) {
