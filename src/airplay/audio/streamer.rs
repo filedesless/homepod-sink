@@ -525,8 +525,10 @@ struct StreamerInner {
 /// between an app and the speaker (on top of the render delay), and the
 /// streamer keeps it 40-50% full - so unlike a file, which buffers 2s, a
 /// live source gets only enough to ride out the capture side's jitter:
-/// PipeWire delivers a chunk every ~21ms.
-const LIVE_BUFFER_MS: u32 = 400;
+/// PipeWire delivers a chunk every ~21ms. It adds no resend headroom (that
+/// is all on the HomePod). Measured with a mic on a desktop: 64-400ms all
+/// played without underruns, and 400 -> 100 cut the delay by ~140ms.
+const LIVE_BUFFER_MS: u32 = 100;
 
 /// How far the anchored timeline may disagree with the actual clock before
 /// it is re-anchored. Far above the encode loop's jitter, so it only fires

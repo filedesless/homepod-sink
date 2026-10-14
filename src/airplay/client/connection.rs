@@ -1220,7 +1220,9 @@ impl Connection {
             let stop_flag = Arc::clone(&self.control_stop);
             let format = &self.stream_config.audio_format;
             let packet_ms = format.frames_per_packet as f64 * 1000.0 / format.sample_rate.as_hz() as f64;
-            let render_delay_ms = self.render_delay_ms;
+            // The HomePod holds latencyMin on top of the render delay, and
+            // waits that whole time for resends (measured with a mic).
+            let window_ms = self.render_delay_ms + self.stream_config.latency_min_ms();
 
             Some(tokio::task::spawn_blocking(move || {
                 tracing::debug!("Control channel thread started for live streaming (5ms poll)");
@@ -1260,7 +1262,7 @@ impl Connection {
                                             // packets since it was sent.
                                             let behind = next_seq.wrapping_sub(request.first_sequence);
                                             burst
-                                                .get_or_insert_with(|| LossBurst::new(render_delay_ms))
+                                                .get_or_insert_with(|| LossBurst::new(window_ms))
                                                 .record(&request, retransmitted, behind as f64 * packet_ms);
                                             if retransmitted > 0 {
                                                 stats.rtx_fulfilled.fetch_add(retransmitted as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1614,7 +1616,9 @@ const LOSS_BURST_GAP: std::time::Duration = std::time::Duration::from_secs(1);
 /// requests, summarized in a single log line once it ends - Wi-Fi loss comes
 /// in clusters of dozens of requests, too many to log one by one.
 struct LossBurst {
-    render_delay_ms: u32,
+    /// How long after sending a packet a resend can still be played: the
+    /// render delay plus the HomePod's latencyMin.
+    window_ms: u32,
     start: std::time::Instant,
     last: std::time::Instant,
     requested: u64,
@@ -1623,7 +1627,7 @@ struct LossBurst {
     repeated: u64,
     /// Packets no longer in the history ring, so never retransmitted.
     missing: u64,
-    /// Packets requested later than the render delay after being sent: the
+    /// Packets requested later than `window_ms` after being sent: the
     /// resend arrives after its play time, so the gap is audible.
     late: u64,
     oldest_ms: f64,
@@ -1631,10 +1635,10 @@ struct LossBurst {
 }
 
 impl LossBurst {
-    fn new(render_delay_ms: u32) -> Self {
+    fn new(window_ms: u32) -> Self {
         let now = std::time::Instant::now();
         Self {
-            render_delay_ms,
+            window_ms,
             start: now,
             last: now,
             requested: 0,
@@ -1652,7 +1656,7 @@ impl LossBurst {
         self.last = std::time::Instant::now();
         self.requested += count;
         self.missing += count.saturating_sub(retransmitted as u64);
-        if age_ms > self.render_delay_ms as f64 {
+        if age_ms > self.window_ms as f64 {
             self.late += count;
         }
         for i in 0..request.count {
@@ -1674,8 +1678,8 @@ impl LossBurst {
         );
         if self.late > 0 || self.missing > 0 {
             tracing::warn!(
-                "Network loss burst, likely audible ({} requested past the {}ms render delay): {}",
-                self.late, self.render_delay_ms, summary
+                "Network loss burst, likely audible ({} requested past the {}ms resend window): {}",
+                self.late, self.window_ms, summary
             );
         } else {
             tracing::info!("Network loss burst, recovered: {}", summary);
@@ -1701,7 +1705,7 @@ mod tests {
             let mut burst = LossBurst::new(200);
             // 3 packets, 74ms old, all resent: recoverable.
             burst.record(&RetransmitRequest { first_sequence: 10, count: 3 }, 3, 74.0);
-            // Asked again for 2 of them, now past the render delay, and one
+            // Asked again for 2 of them, now past the window, and one
             // already fell out of the history.
             burst.record(&RetransmitRequest { first_sequence: 11, count: 2 }, 1, 241.0);
             assert_eq!(burst.requested, 5);

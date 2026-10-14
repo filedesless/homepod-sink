@@ -14,6 +14,6 @@ else
 fi
 
 : "${HOMEPOD_SAMPLE_RATE:=48000}"
-: "${HOMEPOD_RENDER_DELAY_MS:=500}"
+: "${HOMEPOD_RENDER_DELAY_MS:=250}"
 
 exec "$SINK" --sample-rate "$HOMEPOD_SAMPLE_RATE" --render-delay-ms "$HOMEPOD_RENDER_DELAY_MS"

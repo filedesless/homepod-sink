@@ -27,11 +27,12 @@ struct Args {
     sample_rate: u32,
 
     /// How far ahead of real time the HomePod is told to play audio, in
-    /// milliseconds. Lost packets can only be resent within this window, so
-    /// raise it if the log shows "Network loss burst, likely audible" - at
-    /// the cost of that much more delay between an app and the speaker.
-    /// The HomePod accepts up to 2000.
-    #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u32).range(0..=2000))]
+    /// milliseconds. The HomePod buffers another 250ms (latencyMin) on top,
+    /// and lost packets can be resent within both: the default gives a
+    /// ~500ms window. Raise it if the log shows "Network loss burst, likely
+    /// audible" - at the cost of that much more delay between an app and
+    /// the speaker. The HomePod accepts up to 2000.
+    #[arg(long, default_value_t = 250, value_parser = clap::value_parser!(u32).range(0..=2000))]
     render_delay_ms: u32,
 }
 
@@ -207,16 +208,16 @@ async fn is_reachable(device: &Device) -> bool {
 
 /// The stream config for a given render delay.
 fn stream_config(render_delay_ms: u32) -> StreamConfig {
+    // latencyMin stays at realtime_ntp's 250ms rather than following the
+    // render delay. The HomePod adds latencyMin on top of the sync packets'
+    // latency and waits for resends through both (measured with a mic), so
+    // each ms of either costs one ms of delay for one ms of headroom. The
+    // render delay alone is the knob; tying latencyMin to it used to double
+    // the delay without saying so.
     let mut config = StreamConfig::realtime_ntp();
-    // Advertise the render delay in SETUP too: the HomePod picks its buffer
-    // from latencyMin..latencyMax, so a minimum below the render delay
-    // (realtime_ntp's is 250ms) would cap how long it waits for resends.
-    // The HomePod adds latencyMin on top of the sync packets' latency
-    // (measured with a mic: playback lands latencyMin + 10-25ms after the
-    // render delay), so audio is heard about twice the render delay late.
+    // Keep latencyMax above the latency the HomePod is asked for.
     let render_delay_samples = render_delay_ms * config.audio_format.sample_rate.as_hz() / 1000;
-    config.latency_min = config.latency_min.max(render_delay_samples);
-    config.latency_max = config.latency_max.max(config.latency_min);
+    config.latency_max = config.latency_max.max(render_delay_samples);
     config
 }
 

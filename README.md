@@ -204,9 +204,13 @@ systemctl --user enable --now homepod-sink
 `systemd/run.sh` reads two environment variables (see
 `systemd/homepod-sink.env.example`): `HOMEPOD_SAMPLE_RATE` (default
 `48000`), mapped to `homepod-sink --sample-rate`, and
-`HOMEPOD_RENDER_DELAY_MS` (default `500`), mapped to
-`--render-delay-ms` — raise it if lossy Wi-Fi causes stutter, at the cost
-of more audio delay. There's no target device
+`HOMEPOD_RENDER_DELAY_MS` (default `250`), mapped to
+`--render-delay-ms`. The HomePod buffers another 250ms on top of the render
+delay, and lost packets can be resent within both, so the default gives a
+~500ms window, with sound about 0.6s behind the app. Raise it if lossy Wi-Fi
+causes stutter (the log says `Network loss burst, likely audible`): every ms
+added is a ms more headroom and a ms more delay. Browsers and video players
+see the delay and keep video in sync with it. There's no target device
 to configure — pick one from your output picker as usual once the service
 is running.
 
