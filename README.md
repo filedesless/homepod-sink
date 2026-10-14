@@ -195,9 +195,12 @@ systemctl --user daemon-reload
 systemctl --user enable --now homepod-sink
 ```
 
-The only environment variable `systemd/run.sh` reads (see
-`systemd/homepod-sink.env.example`) is `HOMEPOD_SAMPLE_RATE` (default
-`48000`), mapped to `homepod-sink --sample-rate`. There's no target device
+`systemd/run.sh` reads two environment variables (see
+`systemd/homepod-sink.env.example`): `HOMEPOD_SAMPLE_RATE` (default
+`48000`), mapped to `homepod-sink --sample-rate`, and
+`HOMEPOD_RENDER_DELAY_MS` (default `500`), mapped to
+`--render-delay-ms` — raise it if lossy Wi-Fi causes stutter, at the cost
+of more audio delay. There's no target device
 to configure — pick one from your output picker as usual once the service
 is running.
 

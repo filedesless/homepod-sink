@@ -25,6 +25,14 @@ struct Args {
     /// AirPlay internally regardless.
     #[arg(long, default_value_t = 48000)]
     sample_rate: u32,
+
+    /// How far ahead of real time the HomePod is told to play audio, in
+    /// milliseconds. Lost packets can only be resent within this window, so
+    /// raise it if the log shows "Network loss burst, likely audible" - at
+    /// the cost of that much more delay between an app and the speaker.
+    /// The HomePod accepts up to 2000.
+    #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u32).range(0..=2000))]
+    render_delay_ms: u32,
 }
 
 /// AirPlay control port. Never varies in practice - not worth a flag.
@@ -136,7 +144,7 @@ async fn run(args: Args) -> Result<()> {
             device.addresses.first().map(|a| a.to_string()).unwrap_or_default()
         );
 
-        match stream_to_target(&device, args.sample_rate, &mut state, &mut retry_delay).await? {
+        match stream_to_target(&device, &args, &mut state, &mut retry_delay).await? {
             StreamOutcome::Retarget => {}
             StreamOutcome::ConnectionLost(err) => {
                 tracing::warn!("connection to {} lost: {:#}", device.name, err);
@@ -199,11 +207,17 @@ async fn is_reachable(device: &Device) -> bool {
 /// those event sources itself ends.
 async fn stream_to_target<B: tokio_stream::Stream<Item = BrowseEvent> + Unpin>(
     device: &Device,
-    sample_rate: u32,
+    args: &Args,
     state: &mut State<B>,
     retry_delay: &mut Duration,
 ) -> Result<StreamOutcome> {
     let mut config = StreamConfig::realtime_ntp();
+    // Advertise the render delay in SETUP too: the HomePod picks its buffer
+    // from latencyMin..latencyMax, so a minimum below the render delay
+    // (realtime_ntp's is 250ms) would cap how long it waits for resends.
+    let render_delay_samples = args.render_delay_ms * config.audio_format.sample_rate.as_hz() / 1000;
+    config.latency_min = config.latency_min.max(render_delay_samples);
+    config.latency_max = config.latency_max.max(config.latency_min);
     if config.audio_format.codec == AudioCodec::Alac {
         match AlacEncoder::new(config.audio_format.clone()) {
             Ok(temp_encoder) => config.asc = Some(temp_encoder.magic_cookie()),
@@ -215,6 +229,7 @@ async fn stream_to_target<B: tokio_stream::Stream<Item = BrowseEvent> + Unpin>(
         Ok(c) => c,
         Err(e) => return Ok(StreamOutcome::ConnectionLost(e.into())),
     };
+    client.set_render_delay_ms(args.render_delay_ms);
 
     let mut device = device.clone();
     device.port = AIRPLAY_PORT;
@@ -246,7 +261,7 @@ async fn stream_to_target<B: tokio_stream::Stream<Item = BrowseEvent> + Unpin>(
         }
     }
 
-    let (sender, decoder) = LiveAudioDecoder::create_pair(sample_rate, 2, 64);
+    let (sender, decoder) = LiveAudioDecoder::create_pair(args.sample_rate, 2, 64);
     install_active_target(&state.sink_manager, &device.id, sender);
 
     if let Err(e) = client.start_live_streaming_with_decoder(decoder).await {
@@ -254,7 +269,10 @@ async fn stream_to_target<B: tokio_stream::Stream<Item = BrowseEvent> + Unpin>(
         return Ok(StreamOutcome::ConnectionLost(e.into()));
     }
 
-    tracing::info!("streaming to {} at {}Hz stereo", device.name, sample_rate);
+    tracing::info!(
+        "streaming to {} at {}Hz stereo, {}ms render delay",
+        device.name, args.sample_rate, args.render_delay_ms
+    );
     *retry_delay = MIN_RETRY_DELAY;
 
     const MAX_CONSECUTIVE_FAILURES: u32 = 3;

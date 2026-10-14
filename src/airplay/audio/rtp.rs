@@ -576,7 +576,12 @@ impl RtpSender {
     /// - Bytes 4-7: Current playback position in samples (BE)
     /// - Bytes 8-15: NTP timestamp (8 bytes BE - seconds + fraction)
     /// - Bytes 16-19: RTP timestamp (BE)
-    pub fn send_sync(&mut self, rtp_timestamp: u32, ntp_timestamp: u64) -> Result<()> {
+    ///
+    /// The packet says frame `rtp_timestamp - latency` plays at `ntp_timestamp`,
+    /// while `rtp_timestamp` is the newest frame being sent - so the receiver
+    /// learns both the timeline and how far ahead of playback the sender
+    /// runs (`latency` samples), and buffers accordingly.
+    pub fn send_sync(&mut self, rtp_timestamp: u32, ntp_timestamp: u64, latency: u32) -> Result<()> {
         // Get the destination - control port if set, otherwise data port
         let dest = self.control_dest.unwrap_or(self.dest);
 
@@ -609,8 +614,9 @@ impl RtpSender {
         // Bytes 2-3: Sync sequence counter (increment after use)
         packet[2..4].copy_from_slice(&self.sync_sequence.to_be_bytes());
         self.sync_sequence = self.sync_sequence.wrapping_add(1);
-        // Bytes 4-7: Current playback position (use rtp_timestamp)
-        packet[4..8].copy_from_slice(&rtp_timestamp.to_be_bytes());
+        // Bytes 4-7: Frame playing at the NTP time below: current position
+        // minus latency
+        packet[4..8].copy_from_slice(&rtp_timestamp.wrapping_sub(latency).to_be_bytes());
         // Bytes 8-15: NTP timestamp (8 bytes BE)
         packet[8..16].copy_from_slice(&ntp_timestamp.to_be_bytes());
         // Bytes 16-19: RTP timestamp (BE)
@@ -634,7 +640,8 @@ impl RtpSender {
 
     /// Prepare a sync packet without sending. Returns the 20-byte packet data,
     /// or None if the control port is 0 (buffered mode skips sync).
-    pub fn prepare_sync(&mut self, rtp_timestamp: u32, ntp_timestamp: u64) -> Result<Option<Vec<u8>>> {
+    /// See `send_sync` for what `latency` means.
+    pub fn prepare_sync(&mut self, rtp_timestamp: u32, ntp_timestamp: u64, latency: u32) -> Result<Option<Vec<u8>>> {
         let dest = self.control_dest.unwrap_or(self.dest);
 
         if dest.port() == 0 {
@@ -653,7 +660,7 @@ impl RtpSender {
         packet[1] = 0xd4;
         packet[2..4].copy_from_slice(&self.sync_sequence.to_be_bytes());
         self.sync_sequence = self.sync_sequence.wrapping_add(1);
-        packet[4..8].copy_from_slice(&rtp_timestamp.to_be_bytes());
+        packet[4..8].copy_from_slice(&rtp_timestamp.wrapping_sub(latency).to_be_bytes());
         packet[8..16].copy_from_slice(&ntp_timestamp.to_be_bytes());
         packet[16..20].copy_from_slice(&rtp_timestamp.to_be_bytes());
 
@@ -1159,7 +1166,7 @@ mod tests {
             sender.set_control_socket(control_socket);
 
             // Send a sync packet
-            sender.send_sync(0, 0).unwrap();
+            sender.send_sync(0, 0, 0).unwrap();
 
             // Receive it and check the source port
             let mut buf = [0u8; 64];
@@ -1189,7 +1196,7 @@ mod tests {
             let data_port = sender.bind(0).unwrap();
             // No set_control_socket call
 
-            sender.send_sync(0, 0).unwrap();
+            sender.send_sync(0, 0, 0).unwrap();
 
             let mut buf = [0u8; 64];
             let (_len, src_addr) = listener.recv_from(&mut buf).unwrap();
@@ -1210,7 +1217,7 @@ mod tests {
 
             let rtp_ts: u32 = 44100;
             let ntp_ts: u64 = 0xAAAABBBBCCCCDDDD;
-            sender.send_sync(rtp_ts, ntp_ts).unwrap();
+            sender.send_sync(rtp_ts, ntp_ts, 8820).unwrap();
 
             let mut buf = [0u8; 64];
             let (len, _) = listener.recv_from(&mut buf).unwrap();
@@ -1221,8 +1228,8 @@ mod tests {
             assert_eq!(buf[0], 0x90);
             // Byte 1: 0xD4 = marker (0x80) | PT 84 (0x54)
             assert_eq!(buf[1], 0xD4);
-            // Bytes 4-7: RTP timestamp (big-endian)
-            assert_eq!(&buf[4..8], &rtp_ts.to_be_bytes());
+            // Bytes 4-7: RTP timestamp minus latency (big-endian)
+            assert_eq!(&buf[4..8], &(rtp_ts - 8820).to_be_bytes());
             // Bytes 8-15: NTP timestamp (big-endian)
             assert_eq!(&buf[8..16], &ntp_ts.to_be_bytes());
             // Bytes 16-19: RTP timestamp again
@@ -1240,13 +1247,13 @@ mod tests {
             sender.bind(0).unwrap();
 
             // First sync
-            sender.send_sync(0, 0).unwrap();
+            sender.send_sync(0, 0, 0).unwrap();
             let mut buf = [0u8; 64];
             listener.recv_from(&mut buf).unwrap();
             assert_eq!(buf[0], 0x90, "first sync should have extension bit");
 
             // Second sync
-            sender.send_sync(352, 1000).unwrap();
+            sender.send_sync(352, 1000, 0).unwrap();
             listener.recv_from(&mut buf).unwrap();
             assert_eq!(buf[0], 0x80, "subsequent syncs should NOT have extension bit");
         }
@@ -1314,7 +1321,7 @@ mod tests {
             sender.set_control_socket(control_socket);
 
             // Send sync
-            sender.send_sync(0, 0).unwrap();
+            sender.send_sync(0, 0, 0).unwrap();
 
             // Verify it arrived from the control port
             let mut buf = [0u8; 64];

@@ -505,7 +505,7 @@ struct StreamerInner {
     spatial_snapshot: Option<SpatialSnapshot>,
     /// Track whether first audio packet has been sent (requires marker bit)
     first_packet_sent: bool,
-    /// Render delay in nanoseconds added to NTP timestamps in sync packets.
+    /// Render delay in nanoseconds, sent as the latency in sync packets.
     /// Tells the receiver to render audio this far in the future, giving more
     /// time for retransmit recovery of lost packets.
     render_delay_ns: u64,
@@ -1417,9 +1417,11 @@ async fn run_streamer(
                 };
 
                 // Apply render delay
-                // Apply render delay
-                let render_adjusted = adjusted + guard.render_delay_ns;
-                let ntp = unix_to_ntp(render_adjusted);
+                // Render delay: the sync says the frame `latency` samples
+                // behind this one plays now, so this one plays that much
+                // later - and the receiver sizes its buffer to match.
+                let ntp = unix_to_ntp(adjusted);
+                let latency = (guard.render_delay_ns * sample_rate as u64 / 1_000_000_000) as u32;
 
                 // Set marker bit on first audio packet
                 let first_packet = !guard.first_packet_sent;
@@ -1440,7 +1442,7 @@ async fn run_streamer(
                     if let Some(ref tx) = sender_tx {
                         // Sender thread path
                         let sync_data = if need_sync {
-                            guard.rtp_senders[0].prepare_sync(rtp_ts, ntp)?
+                            guard.rtp_senders[0].prepare_sync(rtp_ts, ntp, latency)?
                         } else {
                             None
                         };
@@ -1522,7 +1524,7 @@ async fn run_streamer(
                         // Fallback: direct send (no sender thread)
                         // Send sync from first sender, audio from all senders
                         if need_sync {
-                            guard.rtp_senders[0].send_sync(rtp_ts, ntp)?;
+                            guard.rtp_senders[0].send_sync(rtp_ts, ntp, latency)?;
                         }
 
                         let send_start = Instant::now();
