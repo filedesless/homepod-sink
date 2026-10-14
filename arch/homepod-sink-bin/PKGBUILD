@@ -4,7 +4,7 @@
 # rebuilds on every push to master. CI also bumps pkgver and the checksums
 # below (scripts/bump-bin-pkgbuild.sh) - don't edit them by hand.
 pkgname=homepod-sink-bin
-pkgver=r0.0000000
+pkgver=r28.97b4bf1
 pkgrel=1
 pkgdesc="Turns a HomePod into a PipeWire audio output via AirPlay 2 (prebuilt)"
 arch=('x86_64' 'aarch64')
@@ -18,8 +18,8 @@ options=('!debug' '!strip')
 install=homepod-sink.install
 source_x86_64=("$url/releases/download/latest/homepod-sink-$pkgver-x86_64.tar.gz")
 source_aarch64=("$url/releases/download/latest/homepod-sink-$pkgver-aarch64.tar.gz")
-sha256sums_x86_64=('SKIP')
-sha256sums_aarch64=('SKIP')
+sha256sums_x86_64=('3a868edf4269dca76064bb8c4f1541aaaa2c90ce1e57c19542d0a6defa42afa0')
+sha256sums_aarch64=('d88057f73fbe1143d81bcfcbed40e21520d7438801e9724423b17fe9276fe7ad')
 
 package() {
     cd "$srcdir/homepod-sink-$pkgver-$CARCH"
