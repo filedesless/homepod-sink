@@ -1,9 +1,10 @@
 /target
 
-# makepkg build artifacts
-/arch/pkg/
-/arch/src/
-/arch/homepod-sink-git/
-/arch/.SRCINFO
+# makepkg build artifacts, one directory per package
+/arch/*/pkg/
+/arch/*/src/
+/arch/*/.SRCINFO
+/arch/homepod-sink-git/homepod-sink-git/
+/arch/homepod-sink-bin/*.tar.gz
 *.pkg.tar.zst
 *.pkg.tar.zst.sig

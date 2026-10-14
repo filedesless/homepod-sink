@@ -1,0 +1,38 @@
+# Maintainer: filedesless <filedesless@gmail.com>
+#
+# Prebuilt binaries from the rolling "latest" GitHub release, which CI
+# rebuilds on every push to master. CI also bumps pkgver and the checksums
+# below (scripts/bump-bin-pkgbuild.sh) - don't edit them by hand.
+pkgname=homepod-sink-bin
+pkgver=r0.0000000
+pkgrel=1
+pkgdesc="Turns a HomePod into a PipeWire audio output via AirPlay 2 (prebuilt)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/filedesless/homepod-sink"
+license=('GPL-3.0-or-later')
+depends=('pipewire' 'gcc-libs' 'glibc')
+provides=('homepod-sink')
+conflicts=('homepod-sink')
+backup=('etc/homepod-sink/homepod-sink.env.example')
+options=('!debug' '!strip')
+install=homepod-sink.install
+source_x86_64=("$url/releases/download/latest/homepod-sink-$pkgver-x86_64.tar.gz")
+source_aarch64=("$url/releases/download/latest/homepod-sink-$pkgver-aarch64.tar.gz")
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+    cd "$srcdir/homepod-sink-$pkgver-$CARCH"
+
+    install -Dm755 homepod-sink "$pkgdir/usr/lib/homepod-sink/homepod-sink"
+    install -Dm755 play "$pkgdir/usr/lib/homepod-sink/play"
+    install -Dm755 run.sh "$pkgdir/usr/lib/homepod-sink/run.sh"
+
+    install -Dm644 homepod-sink.service \
+        "$pkgdir/usr/lib/systemd/user/homepod-sink.service"
+    install -Dm644 homepod-sink.env.example \
+        "$pkgdir/etc/homepod-sink/homepod-sink.env.example"
+
+    install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

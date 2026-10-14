@@ -1,0 +1,119 @@
+# On every push to master: build and test for x86_64 and aarch64, publish
+# the tarballs to the rolling "latest" release, and point
+# arch/homepod-sink-bin/PKGBUILD at them so paru picks up the new version.
+name: Release
+
+on:
+  push:
+    branches: [master]
+    # The PKGBUILD bump this workflow commits. (Pushes made with
+    # GITHUB_TOKEN don't trigger workflows anyway; this covers manual edits.)
+    paths-ignore: ['arch/homepod-sink-bin/PKGBUILD']
+  workflow_dispatch:
+
+# One release at a time: each run moves the "latest" tag and commits to
+# master, so runs must not interleave. Queued runs wait, they aren't cancelled.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # for the r<commit count> version
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libpipewire-0.3-dev libclang-dev clang pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+
+      - run: cargo test --release --locked
+      - run: cargo build --release --locked --bin homepod-sink --bin play
+
+      - name: Package
+        run: |
+          version="r$(git rev-list --count HEAD).$(git rev-parse --short HEAD)"
+          scripts/dist.sh "$version" ${{ matrix.arch }} dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Version
+        id: version
+        run: echo "version=r$(git rev-list --count "$GITHUB_SHA").$(git rev-parse --short "$GITHUB_SHA")" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to the "latest" release
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git tag -f latest "$GITHUB_SHA"
+          git push -f origin refs/tags/latest
+          if ! gh release view latest > /dev/null 2>&1; then
+            gh release create latest --title "Latest build" --notes "Rolling build of master."
+          fi
+          gh release upload latest dist/* --clobber
+          gh release edit latest --notes "Rolling build of master, currently $VERSION ($GITHUB_SHA)."
+
+      - name: Bump arch/homepod-sink-bin/PKGBUILD
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          scripts/bump-bin-pkgbuild.sh "$VERSION" dist
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add arch/homepod-sink-bin/PKGBUILD
+          git commit -m "homepod-sink-bin $VERSION"
+          # Retry in case master moved while building.
+          for attempt in 1 2 3; do
+            git pull --rebase origin master && git push origin HEAD:master && exit 0
+            sleep 5
+          done
+          exit 1
+
+      # Last, so the old tarballs stay downloadable until the PKGBUILD
+      # pointing at the new ones has landed.
+      - name: Prune older assets
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release view latest --json assets --jq '.assets[].name' |
+            grep -v -- "-$VERSION-" |
+            xargs -r -n1 gh release delete-asset latest --yes

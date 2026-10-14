@@ -65,26 +65,34 @@ is healthy, independent of everything else.
 
 ### Arch Linux
 
-A `PKGBUILD` is included in `arch/`, building straight from this repo's
-GitHub master (`homepod-sink-git`):
+Two PKGBUILDs live under `arch/`, one directory each (makepkg uses `src/`
+next to a PKGBUILD as its build directory, which would clobber the crate's
+own `src/` at the repo root):
 
-```sh
-cd arch && makepkg -si
-```
+- `homepod-sink-bin`: **prebuilt**, from the rolling
+  [`latest` release](https://github.com/filedesless/homepod-sink/releases/tag/latest).
+  CI (`.github/workflows/release.yml`) rebuilds it for x86_64 and aarch64
+  on every push to master and bumps this PKGBUILD to match, so updating
+  is a download, not a compile.
+- `homepod-sink-git`: builds master from source (needs Rust and clang).
 
-It lives in a subdirectory because makepkg uses `src/` next to the PKGBUILD
-as its build directory, which would clobber the crate's own `src/`. To have
-paru track master instead, add the repo as a PKGBUILD repo in
-`~/.config/paru/paru.conf` (`GenerateSrcinfo` because `.SRCINFO` isn't
-committed) and run `paru -Sy --pkgbuilds && paru -S homepod-sink-git`:
+They conflict with each other; installing one replaces the other. Build
+one by hand with `cd arch/homepod-sink-bin && makepkg -si`, or have paru
+track this repo as a PKGBUILD repo in `~/.config/paru/paru.conf`
+(`GenerateSrcinfo` because `.SRCINFO` isn't committed, `Depth` so paru
+finds the PKGBUILDs one level down in `arch/`):
 
 ```ini
 [homepod-sink]
 Url = https://github.com/filedesless/homepod-sink
+Depth = 2
 GenerateSrcinfo
 ```
 
-This builds and installs both binaries to `/usr/lib/homepod-sink/`
+Then `paru -Sy --pkgbuilds && paru -S homepod-sink-bin`, and `paru -Syu`
+picks up new builds from then on.
+
+Either package installs both binaries to `/usr/lib/homepod-sink/`
 (deliberately not on `PATH`), plus a systemd user unit at
 `/usr/lib/systemd/user/homepod-sink.service` and an env file template at
 `/etc/homepod-sink/homepod-sink.env.example`.
@@ -104,7 +112,7 @@ systemctl --user daemon-reload
 
 Installing enables and starts the service for every logged-in user,
 upgrading restarts it wherever it's running, and uninstalling (`sudo pacman
--R homepod-sink-git`) stops and disables it.
+-R homepod-sink-bin`, or `-git`) stops and disables it.
 
 ### From source
 

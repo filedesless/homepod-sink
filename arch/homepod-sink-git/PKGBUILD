@@ -13,7 +13,7 @@ conflicts=('homepod-sink')
 backup=('etc/homepod-sink/homepod-sink.env.example')
 source=("$pkgname::git+$url.git")
 sha256sums=('SKIP')
-install=$pkgname.install
+install=homepod-sink.install
 
 pkgver() {
     cd "$srcdir/$pkgname"
