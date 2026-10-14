@@ -79,13 +79,14 @@ own `src/` at the repo root):
 They conflict with each other; installing one replaces the other. Build
 one by hand with `cd arch/homepod-sink-bin && makepkg -si`, or have paru
 track this repo as a PKGBUILD repo in `~/.config/paru/paru.conf`
-(`GenerateSrcinfo` because `.SRCINFO` isn't committed, `Depth` so paru
-finds the PKGBUILDs one level down in `arch/`):
+(`GenerateSrcinfo` because `.SRCINFO` isn't committed; `Depth = 3`
+because paru only looks one directory deep by default, despite its man
+page saying 3, and the PKGBUILDs are two deep):
 
 ```ini
 [homepod-sink]
 Url = https://github.com/filedesless/homepod-sink
-Depth = 2
+Depth = 3
 GenerateSrcinfo
 ```
 
