@@ -1372,6 +1372,12 @@ impl Connection {
         self.streamer.as_ref().map_or(0, |s| s.underruns())
     }
 
+    /// Live audio's delay from this connection's streamer to the receiver
+    /// playing it (see `AudioStreamer::output_latency_ns`).
+    pub fn output_latency_ns(&self) -> Option<u64> {
+        self.streamer.as_ref().and_then(|s| s.output_latency_ns())
+    }
+
     /// Set render delay in milliseconds.
     ///
     /// Shifts NTP timestamps in sync packets into the future, telling the

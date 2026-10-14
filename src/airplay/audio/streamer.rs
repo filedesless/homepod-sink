@@ -569,6 +569,9 @@ pub struct AudioStreamer {
     packets_sent: Arc<AtomicU64>,
     /// Buffer underruns: times the buffer was empty when a packet was due.
     underruns: Arc<AtomicU64>,
+    /// Delay from audio reaching the streamer to the receiver playing it,
+    /// in ns: render delay plus audio queued here. 0 until streaming starts.
+    output_latency_ns: Arc<AtomicU64>,
     /// Dedicated sender thread for precise packet timing.
     sender_thread: Option<std::thread::JoinHandle<()>>,
     /// Channel to send packets to the sender thread.
@@ -589,6 +592,7 @@ impl Clone for AudioStreamer {
             timestamp_cache: Arc::clone(&self.timestamp_cache),
             packets_sent: Arc::clone(&self.packets_sent),
             underruns: Arc::clone(&self.underruns),
+            output_latency_ns: Arc::clone(&self.output_latency_ns),
             sender_thread: None, // Can't clone JoinHandle
             sender_tx: self.sender_tx.clone(),
             sender_stats: Arc::clone(&self.sender_stats),
@@ -629,6 +633,7 @@ impl AudioStreamer {
             timestamp_cache: Arc::new(AtomicU64::new(0)),
             packets_sent: Arc::new(AtomicU64::new(0)),
             underruns: Arc::new(AtomicU64::new(0)),
+            output_latency_ns: Arc::new(AtomicU64::new(0)),
             sender_thread: None,
             sender_tx: None,
             sender_stats: Arc::new(SenderStats::default()),
@@ -750,6 +755,26 @@ impl AudioStreamer {
         self.underruns.load(Ordering::Relaxed)
     }
 
+    /// How long live audio takes from reaching the streamer to being
+    /// heard, in ns, as of the last packet sent (see
+    /// `live_output_latency_ns`).
+    /// None until the first live packet is sent.
+    pub fn output_latency_ns(&self) -> Option<u64> {
+        match self.output_latency_ns.load(Ordering::Relaxed) {
+            0 => None,
+            ns => Some(ns),
+        }
+    }
+
+    /// Expected `output_latency_ns` for a live stream with `config` and
+    /// `render_delay_ms`, before one is running. The live queue measures
+    /// at about half the live buffer.
+    pub fn expected_live_output_latency_ns(config: &StreamConfig, render_delay_ms: u32) -> u64 {
+        render_delay_ms as u64 * 1_000_000
+            + receiver_latency_ns(config)
+            + LIVE_BUFFER_MS as u64 / 2 * 1_000_000
+    }
+
     /// Get current state.
     pub fn state(&self) -> StreamerState {
         match self.state_cache.load(Ordering::Relaxed) {
@@ -849,9 +874,10 @@ impl AudioStreamer {
             let timestamp_cache = self.timestamp_cache.clone();
             let packets_sent = self.packets_sent.clone();
             let underruns = self.underruns.clone();
+            let output_latency_ns = self.output_latency_ns.clone();
             let sender_tx = self.sender_tx.clone();
             self.task = Some(tokio::spawn(async move {
-                match run_streamer(inner.clone(), state_cache.clone(), timestamp_cache, packets_sent, underruns, sender_tx).await {
+                match run_streamer(inner.clone(), state_cache.clone(), timestamp_cache, packets_sent, underruns, output_latency_ns, sender_tx).await {
                     Ok(()) => tracing::debug!("Streaming task completed normally"),
                     Err(e) => {
                         tracing::error!("Streaming task error: {}", e);
@@ -995,9 +1021,10 @@ impl AudioStreamer {
             let timestamp_cache = self.timestamp_cache.clone();
             let packets_sent = self.packets_sent.clone();
             let underruns = self.underruns.clone();
+            let output_latency_ns = self.output_latency_ns.clone();
             let sender_tx = self.sender_tx.clone();
             self.task = Some(tokio::spawn(async move {
-                match run_streamer(inner.clone(), state_cache.clone(), timestamp_cache, packets_sent, underruns, sender_tx).await {
+                match run_streamer(inner.clone(), state_cache.clone(), timestamp_cache, packets_sent, underruns, output_latency_ns, sender_tx).await {
                     Ok(()) => tracing::debug!("Live streaming task completed normally"),
                     Err(e) => {
                         tracing::error!("Live streaming task error: {}", e);
@@ -1147,6 +1174,31 @@ impl AudioStreamer {
     }
 }
 
+/// Delay the receiver adds after the render delay: HomePods play
+/// latencyMin (from SETUP) on top of the sync packets' latency, plus
+/// RECEIVER_OUTPUT_NS of their own. Measured with a mic at 250, 500 and
+/// 1000ms latencyMin.
+fn receiver_latency_ns(config: &StreamConfig) -> u64 {
+    const RECEIVER_OUTPUT_NS: u64 = 15_000_000;
+    let rate = config.audio_format.sample_rate.as_hz().max(1) as u64;
+    config.latency_min as u64 * 1_000_000_000 / rate + RECEIVER_OUTPUT_NS
+}
+
+/// How long live audio takes from reaching the streamer to being heard:
+/// the live audio queued ahead of the packet being sent (the packets left
+/// in the buffer and what the live decoder holds), then the render delay
+/// and the receiver's own latency.
+fn live_output_latency_ns(inner: &StreamerInner) -> u64 {
+    let format = &inner.config.audio_format;
+    let rate = format.sample_rate.as_hz().max(1) as u64;
+    let buffered = inner.buffer.len() as u64 * format.frames_per_packet as u64 * 1_000_000_000 / rate;
+    let decoder = inner
+        .live_decoder
+        .as_ref()
+        .map_or(0, |d| d.queued_ns(format.sample_rate.as_hz(), format.channels));
+    buffered + decoder + inner.render_delay_ns + receiver_latency_ns(&inner.config)
+}
+
 fn decode_some_inner(inner: &mut StreamerInner) -> Result<()> {
     let format = inner.config.audio_format.clone();
     let frames_per_packet = format.frames_per_packet as usize;
@@ -1190,6 +1242,7 @@ async fn run_streamer(
     timestamp_cache: Arc<AtomicU64>,
     packets_sent_counter: Arc<AtomicU64>,
     underrun_counter: Arc<AtomicU64>,
+    output_latency_ns: Arc<AtomicU64>,
     sender_tx: Option<Sender<SenderMessage>>,
 ) -> Result<()> {
     // Compute frame duration once (constant for the session)
@@ -1280,6 +1333,9 @@ async fn run_streamer(
             }
 
             let frame = guard.buffer.pop();
+            if frame.is_some() && guard.live_decoder.is_some() {
+                output_latency_ns.store(live_output_latency_ns(&guard), Ordering::Relaxed);
+            }
             if let Some(frame) = frame {
                 // Diagnostic: log PCM sample energy for first few frames
                 static DIAG_COUNT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);

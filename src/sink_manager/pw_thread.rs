@@ -186,6 +186,7 @@ pub fn run(
     waker_tx: std::sync::mpsc::Sender<PwWaker>,
     sink_event_tx: UnboundedSender<SinkEvent>,
     sample_rate: u32,
+    initial_latency_ns: u64,
 ) -> anyhow::Result<()> {
     pw::init();
 
@@ -305,6 +306,7 @@ pub fn run(
                             &active_target,
                             clock_start,
                             sample_rate,
+                            initial_latency_ns,
                             &sink_event_tx,
                             &event,
                         );
@@ -315,6 +317,11 @@ pub fn run(
                     PwCommand::SetSinkVolume { id, volume } => {
                         if let Some(live_sink) = sinks.borrow().get(&id) {
                             set_sink_volume(&live_sink.stream, volume);
+                        }
+                    }
+                    PwCommand::SetSinkLatency { id, latency_ns } => {
+                        if let Some(live_sink) = sinks.borrow().get(&id) {
+                            set_sink_latency(&live_sink.stream, latency_ns);
                         }
                     }
                     PwCommand::Shutdown => {
@@ -400,6 +407,7 @@ fn handle_browse_event(
     active_target: &ActiveTarget,
     clock_start: Instant,
     sample_rate: u32,
+    latency_ns: u64,
     sink_event_tx: &UnboundedSender<SinkEvent>,
     event: &crate::airplay::discovery::BrowseEvent,
 ) {
@@ -412,6 +420,7 @@ fn handle_browse_event(
                 &node_name,
                 clock_start,
                 sample_rate,
+                latency_ns,
                 active_target,
                 sink_event_tx,
             ) {
@@ -495,12 +504,70 @@ fn set_sink_volume(stream: &pw::stream::StreamRc, volume: f32) {
     }
 }
 
+/// Report a sink's latency to PipeWire, so clients (browsers, video
+/// players) see it in their output delay and hold video back to match.
+fn set_sink_latency(stream: &pw::stream::StreamRc, latency_ns: u64) {
+    let result = latency_params(latency_ns).and_then(|[a, b]| {
+        stream
+            .update_params(&mut [Pod::from_bytes(&a).unwrap(), Pod::from_bytes(&b).unwrap()])
+            .map_err(anyhow::Error::from)
+    });
+    if let Err(e) = result {
+        warn!("failed to set sink latency: {}", e);
+    }
+}
+
+/// Latency and ProcessLatency params for a sink that delays its input by
+/// `latency_ns` before it's heard. Mirrors PipeWire's own RTP/RAOP sinks
+/// (module-rtp/stream.c, update_latency_params): ProcessLatency alone
+/// isn't propagated to a terminal sink's input ports, so the latency is
+/// also set as a Latency param in the stream's own (input) direction.
+fn latency_params(latency_ns: u64) -> anyhow::Result<[Vec<u8>; 2]> {
+    use pw::spa::pod::{Object, Property, Value};
+    use spa::sys::{
+        SPA_DIRECTION_INPUT, SPA_PARAM_LATENCY_direction, SPA_PARAM_LATENCY_maxNs,
+        SPA_PARAM_LATENCY_maxQuantum, SPA_PARAM_LATENCY_maxRate, SPA_PARAM_LATENCY_minNs,
+        SPA_PARAM_LATENCY_minQuantum, SPA_PARAM_LATENCY_minRate, SPA_PARAM_PROCESS_LATENCY_ns,
+    };
+
+    let ns = Value::Long(latency_ns as i64);
+    let latency = Object {
+        type_: spa::utils::SpaTypes::ObjectParamLatency.as_raw(),
+        id: spa::param::ParamType::Latency.as_raw(),
+        properties: vec![
+            Property::new(SPA_PARAM_LATENCY_direction, Value::Id(spa::utils::Id(SPA_DIRECTION_INPUT))),
+            Property::new(SPA_PARAM_LATENCY_minQuantum, Value::Float(0.0)),
+            Property::new(SPA_PARAM_LATENCY_maxQuantum, Value::Float(0.0)),
+            Property::new(SPA_PARAM_LATENCY_minRate, Value::Int(0)),
+            Property::new(SPA_PARAM_LATENCY_maxRate, Value::Int(0)),
+            Property::new(SPA_PARAM_LATENCY_minNs, ns.clone()),
+            Property::new(SPA_PARAM_LATENCY_maxNs, ns.clone()),
+        ],
+    };
+    let process_latency = Object {
+        type_: spa::utils::SpaTypes::ObjectParamProcessLatency.as_raw(),
+        id: spa::param::ParamType::ProcessLatency.as_raw(),
+        properties: vec![Property::new(SPA_PARAM_PROCESS_LATENCY_ns, ns)],
+    };
+    let serialize = |obj| -> anyhow::Result<Vec<u8>> {
+        Ok(pw::spa::pod::serialize::PodSerializer::serialize(
+            std::io::Cursor::new(Vec::new()),
+            &Value::Object(obj),
+        )?
+        .0
+        .into_inner())
+    };
+    Ok([serialize(latency)?, serialize(process_latency)?])
+}
+
+#[allow(clippy::too_many_arguments)]
 fn create_sink(
     core: &pw::core::CoreRc,
     device_id: &DeviceId,
     node_name: &str,
     clock_start: Instant,
     sample_rate: u32,
+    latency_ns: u64,
     active_target: &ActiveTarget,
     sink_event_tx: &UnboundedSender<SinkEvent>,
 ) -> anyhow::Result<LiveSink> {
@@ -648,7 +715,12 @@ fn create_sink(
     .0
     .into_inner();
 
-    let mut params = [Pod::from_bytes(&values).unwrap()];
+    let [latency, process_latency] = latency_params(latency_ns)?;
+    let mut params = [
+        Pod::from_bytes(&values).unwrap(),
+        Pod::from_bytes(&latency).unwrap(),
+        Pod::from_bytes(&process_latency).unwrap(),
+    ];
 
     stream.connect(
         spa::utils::Direction::Input,

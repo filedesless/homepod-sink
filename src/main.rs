@@ -4,7 +4,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 
-use homepod_sink::airplay::audio::{AlacEncoder, LiveAudioDecoder, LiveFrameSender};
+use homepod_sink::airplay::audio::{AlacEncoder, AudioStreamer, LiveAudioDecoder, LiveFrameSender};
 use homepod_sink::airplay::client::AirPlayClient;
 use homepod_sink::airplay::core::device::{Device, DeviceId};
 use homepod_sink::airplay::core::{AudioCodec, StreamConfig};
@@ -114,7 +114,11 @@ impl<B: tokio_stream::Stream<Item = BrowseEvent> + Unpin> State<B> {
 }
 
 async fn run(args: Args) -> Result<()> {
-    let (sink_manager, sink_events) = SinkManager::spawn(args.sample_rate)
+    let expected_latency_ns = AudioStreamer::expected_live_output_latency_ns(
+        &stream_config(args.render_delay_ms),
+        args.render_delay_ms,
+    );
+    let (sink_manager, sink_events) = SinkManager::spawn(args.sample_rate, expected_latency_ns)
         .context("failed to start PipeWire sink manager")?;
 
     let browser = ServiceBrowser::new().context("failed to start mDNS browser")?;
@@ -201,6 +205,21 @@ async fn is_reachable(device: &Device) -> bool {
     false
 }
 
+/// The stream config for a given render delay.
+fn stream_config(render_delay_ms: u32) -> StreamConfig {
+    let mut config = StreamConfig::realtime_ntp();
+    // Advertise the render delay in SETUP too: the HomePod picks its buffer
+    // from latencyMin..latencyMax, so a minimum below the render delay
+    // (realtime_ntp's is 250ms) would cap how long it waits for resends.
+    // The HomePod adds latencyMin on top of the sync packets' latency
+    // (measured with a mic: playback lands latencyMin + 10-25ms after the
+    // render delay), so audio is heard about twice the render delay late.
+    let render_delay_samples = render_delay_ms * config.audio_format.sample_rate.as_hz() / 1000;
+    config.latency_min = config.latency_min.max(render_delay_samples);
+    config.latency_max = config.latency_max.max(config.latency_min);
+    config
+}
+
 /// Connect to `device` and stream to it until either the connection dies
 /// (feedback failures) or it stops being the target. Keeps discovery and
 /// sink-activity event handling running throughout. Errors only if one of
@@ -211,13 +230,7 @@ async fn stream_to_target<B: tokio_stream::Stream<Item = BrowseEvent> + Unpin>(
     state: &mut State<B>,
     retry_delay: &mut Duration,
 ) -> Result<StreamOutcome> {
-    let mut config = StreamConfig::realtime_ntp();
-    // Advertise the render delay in SETUP too: the HomePod picks its buffer
-    // from latencyMin..latencyMax, so a minimum below the render delay
-    // (realtime_ntp's is 250ms) would cap how long it waits for resends.
-    let render_delay_samples = args.render_delay_ms * config.audio_format.sample_rate.as_hz() / 1000;
-    config.latency_min = config.latency_min.max(render_delay_samples);
-    config.latency_max = config.latency_max.max(config.latency_min);
+    let mut config = stream_config(args.render_delay_ms);
     if config.audio_format.codec == AudioCodec::Alac {
         match AlacEncoder::new(config.audio_format.clone()) {
             Ok(temp_encoder) => config.asc = Some(temp_encoder.magic_cookie()),
@@ -280,9 +293,24 @@ async fn stream_to_target<B: tokio_stream::Stream<Item = BrowseEvent> + Unpin>(
     let mut feedback_interval = tokio::time::interval(Duration::from_secs(2));
     feedback_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    // Last latency reported to PipeWire for this sink. Only changes beyond
+    // LATENCY_REPORT_STEP_NS are re-reported: clients re-sync video to each
+    // report, and the measured queue wobbles by a few packets.
+    const LATENCY_REPORT_STEP_NS: u64 = 20_000_000;
+    let mut reported_latency_ns: Option<u64> = None;
+
     let result = loop {
         tokio::select! {
             _ = feedback_interval.tick() => {
+                if let Some(latency_ns) = client.output_latency_ns() {
+                    let changed = reported_latency_ns
+                        .is_none_or(|reported| reported.abs_diff(latency_ns) > LATENCY_REPORT_STEP_NS);
+                    if changed {
+                        tracing::info!("reporting {}ms latency for {}", latency_ns / 1_000_000, device.name);
+                        state.sink_manager.set_sink_latency(device.id.clone(), latency_ns);
+                        reported_latency_ns = Some(latency_ns);
+                    }
+                }
                 match client.send_feedback().await {
                     Ok(()) => consecutive_failures = 0,
                     Err(e) => {

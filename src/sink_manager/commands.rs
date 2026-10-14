@@ -21,6 +21,9 @@ pub enum PwCommand {
     /// Move a device's sink volume slider (0.0-1.0, unmuting if above 0),
     /// e.g. to match the volume the device itself reported.
     SetSinkVolume { id: DeviceId, volume: f32 },
+    /// Report a device's sink latency to PipeWire: how long audio played
+    /// into it takes to be heard.
+    SetSinkLatency { id: DeviceId, latency_ns: u64 },
     /// Stop the PipeWire mainloop and exit its thread.
     Shutdown,
 }

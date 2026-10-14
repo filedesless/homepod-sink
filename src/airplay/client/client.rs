@@ -468,6 +468,12 @@ impl AirPlayClient {
         Arc::clone(&self.stream_stats)
     }
 
+    /// Live audio's delay from the streamer to the device playing it, in
+    /// ns, or None before live streaming has sent anything.
+    pub fn output_latency_ns(&self) -> Option<u64> {
+        self.connection.as_ref().and_then(|c| c.output_latency_ns())
+    }
+
     /// Get a snapshot of current stream statistics.
     pub fn stats_snapshot(&self) -> super::stats::StatsSnapshot {
         if let Some(ref conn) = self.connection {

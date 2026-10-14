@@ -26,7 +26,12 @@ impl SinkManager {
     /// Spawns the dedicated PipeWire mainloop thread and returns a handle
     /// to it plus the channel on which `SinkEvent`s (sink activity
     /// changes) will arrive.
-    pub fn spawn(sample_rate: u32) -> anyhow::Result<(Self, UnboundedReceiver<SinkEvent>)> {
+    /// `latency_ns` is the latency each sink reports to PipeWire until
+    /// `set_sink_latency` measures a real one.
+    pub fn spawn(
+        sample_rate: u32,
+        latency_ns: u64,
+    ) -> anyhow::Result<(Self, UnboundedReceiver<SinkEvent>)> {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<PwCommand>();
         let (waker_tx, waker_rx) = std::sync::mpsc::channel();
         let (sink_event_tx, sink_event_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -38,7 +43,7 @@ impl SinkManager {
                 // its doc comment) and so is constructed here, on the PW
                 // thread itself, rather than passed in from the spawning
                 // thread (which would require it to be Send).
-                if let Err(e) = pw_thread::run(cmd_rx, waker_tx, sink_event_tx, sample_rate)
+                if let Err(e) = pw_thread::run(cmd_rx, waker_tx, sink_event_tx, sample_rate, latency_ns)
                 {
                     tracing::error!("PipeWire sink manager thread exited with error: {:#}", e);
                 }
@@ -73,6 +78,12 @@ impl SinkManager {
     /// Move a device's sink volume slider to `volume` (0.0-1.0).
     pub fn set_sink_volume(&self, id: DeviceId, volume: f32) {
         let _ = self.cmd_tx.send(PwCommand::SetSinkVolume { id, volume });
+        self.waker.wake();
+    }
+
+    /// Report a device's sink latency to PipeWire.
+    pub fn set_sink_latency(&self, id: DeviceId, latency_ns: u64) {
+        let _ = self.cmd_tx.send(PwCommand::SetSinkLatency { id, latency_ns });
         self.waker.wake();
     }
 

@@ -30,6 +30,8 @@ pub struct LiveFrameSender {
     /// try_send runs on PipeWire's realtime thread, which must not log -
     /// and reported by the decoder side.
     dropped: Arc<AtomicU64>,
+    /// Shared with the decoder: frames sent but not yet received.
+    pending_frames: Arc<AtomicU64>,
 }
 
 impl LiveFrameSender {
@@ -37,13 +39,19 @@ impl LiveFrameSender {
     ///
     /// Returns true if the frame was sent, false if the channel is full.
     pub fn try_send(&self, frame: LivePcmFrame) -> bool {
+        let frames = frame_count(&frame);
+        // Counted before sending so the decoder's subtraction never
+        // runs ahead of it.
+        self.pending_frames.fetch_add(frames, Ordering::Relaxed);
         match self.tx.try_send(frame) {
             Ok(()) => true,
             Err(TrySendError::Full(_)) => {
+                self.pending_frames.fetch_sub(frames, Ordering::Relaxed);
                 self.dropped.fetch_add(1, Ordering::Relaxed);
                 false
             }
             Err(TrySendError::Disconnected(_)) => {
+                self.pending_frames.fetch_sub(frames, Ordering::Relaxed);
                 tracing::debug!("Live audio channel disconnected");
                 false
             }
@@ -52,7 +60,13 @@ impl LiveFrameSender {
 
     /// Send a frame, blocking if the channel is full.
     pub fn send(&self, frame: LivePcmFrame) -> bool {
-        self.tx.send(frame).is_ok()
+        let frames = frame_count(&frame);
+        self.pending_frames.fetch_add(frames, Ordering::Relaxed);
+        let sent = self.tx.send(frame).is_ok();
+        if !sent {
+            self.pending_frames.fetch_sub(frames, Ordering::Relaxed);
+        }
+        sent
     }
 
     /// Get the channel capacity.
@@ -66,6 +80,10 @@ impl LiveFrameSender {
     }
 }
 
+fn frame_count(frame: &LivePcmFrame) -> u64 {
+    (frame.samples.len() / frame.channels.max(1) as usize) as u64
+}
+
 /// Live audio decoder that receives PCM from a channel.
 ///
 /// This provides a decoder-like interface compatible with AudioStreamer,
@@ -76,6 +94,8 @@ pub struct LiveAudioDecoder {
     dropped: Arc<AtomicU64>,
     /// `dropped` as of the last report, to log only new drops.
     reported_dropped: u64,
+    /// Shared with the sender: frames in the channel, at `sample_rate`.
+    pending_frames: Arc<AtomicU64>,
     sample_rate: u32,
     channels: u8,
     position_samples: u64,
@@ -99,6 +119,7 @@ impl LiveAudioDecoder {
             rx,
             dropped: Arc::new(AtomicU64::new(0)),
             reported_dropped: 0,
+            pending_frames: Arc::new(AtomicU64::new(0)),
             sample_rate,
             channels,
             position_samples: 0,
@@ -116,7 +137,11 @@ impl LiveAudioDecoder {
     pub fn create_pair(sample_rate: u32, channels: u8, capacity: usize) -> (LiveFrameSender, Self) {
         let (tx, rx) = bounded::<LivePcmFrame>(capacity);
         let decoder = Self::new(rx, sample_rate, channels);
-        let sender = LiveFrameSender { tx, dropped: Arc::clone(&decoder.dropped) };
+        let sender = LiveFrameSender {
+            tx,
+            dropped: Arc::clone(&decoder.dropped),
+            pending_frames: Arc::clone(&decoder.pending_frames),
+        };
         (sender, decoder)
     }
 
@@ -176,6 +201,7 @@ impl LiveAudioDecoder {
 
         match self.rx.recv_timeout(self.recv_timeout) {
             Ok(frame) => {
+                self.pending_frames.fetch_sub(frame_count(&frame), Ordering::Relaxed);
                 let num_frames = frame.samples.len() / frame.channels as usize;
                 let decoded = DecodedFrame {
                     samples: frame.samples,
@@ -279,6 +305,16 @@ impl LiveAudioDecoder {
         }))
     }
 
+    /// Audio received from the source but not yet handed out as a packet:
+    /// frames still in the channel plus the resampled residual. `target_rate`
+    /// and `target_channels` describe the residual, which is post-resample.
+    pub fn queued_ns(&self, target_rate: u32, target_channels: u8) -> u64 {
+        let pending = self.pending_frames.load(Ordering::Relaxed);
+        let residual = (self.residual_samples.len() / target_channels.max(1) as usize) as u64;
+        pending * 1_000_000_000 / self.sample_rate.max(1) as u64
+            + residual * 1_000_000_000 / target_rate.max(1) as u64
+    }
+
     /// Check if at end of stream.
     pub fn is_eof(&self) -> bool {
         self.eof && self.rx.is_empty()
@@ -338,6 +374,37 @@ mod tests {
         let decoded = decoded.unwrap();
         assert_eq!(decoded.samples.len(), 704);
         assert_eq!(decoded.samples[0], 100);
+    }
+
+    #[test]
+    fn queued_ns_counts_frames_in_channel() {
+        let (sender, mut decoder) = LiveAudioDecoder::create_pair(48000, 2, 2);
+        let frame = || LivePcmFrame { samples: vec![0i16; 960 * 2], channels: 2, sample_rate: 48000 };
+
+        assert_eq!(decoder.queued_ns(44100, 2), 0);
+        assert!(sender.try_send(frame()));
+        assert!(sender.try_send(frame()));
+        // 2 x 960 frames at 48kHz = 40ms.
+        assert_eq!(decoder.queued_ns(44100, 2), 40_000_000);
+
+        // A send dropped on a full channel isn't counted.
+        assert!(!sender.try_send(frame()));
+        assert_eq!(decoder.queued_ns(44100, 2), 40_000_000);
+
+        decoder.decode_frame().unwrap().unwrap();
+        assert_eq!(decoder.queued_ns(44100, 2), 20_000_000);
+    }
+
+    #[test]
+    fn queued_ns_includes_resampled_residual() {
+        let (sender, mut decoder) = LiveAudioDecoder::create_pair(44100, 2, 8);
+        decoder.set_recv_timeout(Duration::from_millis(1));
+        // 500 frames: one 352-frame packet out, 148 frames left as residual.
+        assert!(sender.try_send(LivePcmFrame { samples: vec![0i16; 1000], channels: 2, sample_rate: 44100 }));
+
+        let packet = decoder.decode_resampled(&test_format(), 352).unwrap();
+        assert!(packet.is_some());
+        assert_eq!(decoder.queued_ns(44100, 2), 148 * 1_000_000_000 / 44100);
     }
 
     #[test]
