@@ -1,6 +1,6 @@
 # On every push to master: build and test for x86_64 and aarch64, and
 # publish the tarballs plus a manifest (version and checksums) to the
-# rolling "latest" release. arch/homepod-sink-bin/PKGBUILD reads that
+# rolling "latest" release. arch/PKGBUILD reads that
 # manifest, so nothing gets committed back.
 name: Release
 

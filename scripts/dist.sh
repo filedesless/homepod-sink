@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Packs an already-built release (cargo build --release --bin homepod-sink
 # --bin play) into homepod-sink-<version>-<arch>.tar.gz under <outdir>, with
-# everything arch/homepod-sink-bin/PKGBUILD installs, plus a .sha256 next to it.
+# everything arch/PKGBUILD installs, plus a .sha256 next to it.
 #
 #   scripts/dist.sh r27.2597d29 x86_64 dist
 set -euo pipefail

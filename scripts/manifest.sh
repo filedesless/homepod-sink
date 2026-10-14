@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Writes <distdir>/manifest, which arch/homepod-sink-bin/PKGBUILD reads from
+# Writes <distdir>/manifest, which arch/PKGBUILD reads from
 # the "latest" release to learn the current version and checksums, from the
 # .sha256 files scripts/dist.sh wrote for each arch:
 #

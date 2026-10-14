@@ -65,38 +65,32 @@ is healthy, independent of everything else.
 
 ### Arch Linux
 
-Two PKGBUILDs live under `arch/`, one directory each (makepkg uses `src/`
-next to a PKGBUILD as its build directory, which would clobber the crate's
-own `src/` at the repo root):
+`arch/PKGBUILD` builds `homepod-sink-bin`: **prebuilt** binaries from the
+rolling [`latest` release](https://github.com/filedesless/homepod-sink/releases/tag/latest).
+CI (`.github/workflows/release.yml`) rebuilds it for x86_64 and aarch64 on
+every push to master, alongside a `manifest` with the version and
+checksums. The PKGBUILD reads that manifest whenever it's evaluated (paru
+re-evaluates it on every refresh), so updating is a download, not a
+compile, and no per-release commit is needed. That lookup is why this
+PKGBUILD couldn't go on the AUR as-is. It lives in `arch/` rather than the
+repo root because makepkg uses `src/` next to a PKGBUILD as its build
+directory, which would clobber the crate's own `src/`.
 
-- `homepod-sink-bin`: **prebuilt**, from the rolling
-  [`latest` release](https://github.com/filedesless/homepod-sink/releases/tag/latest).
-  CI (`.github/workflows/release.yml`) rebuilds it for x86_64 and aarch64
-  on every push to master, alongside a `manifest` with the version and
-  checksums. The PKGBUILD reads that manifest whenever it's evaluated
-  (paru re-evaluates it on every refresh), so updating is a download, not
-  a compile, and no per-release commit is needed. That lookup is why this
-  PKGBUILD couldn't go on the AUR as-is.
-- `homepod-sink-git`: builds master from source (needs Rust and clang).
-
-They conflict with each other; installing one replaces the other. Build
-one by hand with `cd arch/homepod-sink-bin && makepkg -si`, or have paru
-track this repo as a PKGBUILD repo in `~/.config/paru/paru.conf`
-(`GenerateSrcinfo` because `.SRCINFO` isn't committed; `Depth = 3`
-because paru only looks one directory deep by default, despite its man
-page saying 3, and the PKGBUILDs are two deep):
+Build it by hand with `cd arch && makepkg -si`, or have paru track this
+repo as a PKGBUILD repo in `~/.config/paru/paru.conf` (`GenerateSrcinfo`
+because `.SRCINFO` isn't committed):
 
 ```ini
 [homepod-sink]
 Url = https://github.com/filedesless/homepod-sink
-Depth = 3
 GenerateSrcinfo
 ```
 
 Then `paru -Sy --pkgbuilds && paru -S homepod-sink-bin`, and `paru -Syu`
-picks up new builds from then on.
+picks up new builds from then on. To build from source instead, see
+[From source](#from-source) below.
 
-Either package installs both binaries to `/usr/lib/homepod-sink/`
+The package installs both binaries to `/usr/lib/homepod-sink/`
 (deliberately not on `PATH`), plus a systemd user unit at
 `/usr/lib/systemd/user/homepod-sink.service` and an env file template at
 `/etc/homepod-sink/homepod-sink.env.example`.
@@ -116,7 +110,7 @@ systemctl --user daemon-reload
 
 Installing enables and starts the service for every logged-in user,
 upgrading restarts it wherever it's running, and uninstalling (`sudo pacman
--R homepod-sink-bin`, or `-git`) stops and disables it.
+-R homepod-sink-bin`) stops and disables it.
 
 ### From source
 
