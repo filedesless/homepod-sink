@@ -1,10 +1,30 @@
 # Maintainer: filedesless <filedesless@gmail.com>
 #
 # Prebuilt binaries from the rolling "latest" GitHub release, which CI
-# rebuilds on every push to master. CI also bumps pkgver and the checksums
-# below (scripts/bump-bin-pkgbuild.sh) - don't edit them by hand.
+# rebuilds on every push to master. Nothing here is bumped per release:
+# pkgver and the checksums come from the release's `manifest` asset
+# (scripts/manifest.sh), looked up whenever this file is evaluated - and
+# paru re-evaluates it (GenerateSrcinfo) on every refresh, so `paru -Syu`
+# sees each new build without a commit. That network lookup is fine for a
+# PKGBUILD repo but not allowed on the AUR.
+
+# Fetched once per build: makepkg re-sources this file (e.g. under
+# fakeroot), and a release landing mid-build mustn't change pkgver between
+# downloading and packaging. Parsed field by field, never eval'd. Offline
+# or on a malformed manifest, pkgver falls back to r0 (with SKIP sums, so
+# the file still evaluates): paru sees no update, and r0 can't be built.
+_release=https://github.com/filedesless/homepod-sink/releases/download/latest
+export _HOMEPOD_SINK_MANIFEST="${_HOMEPOD_SINK_MANIFEST-$(curl -fsSL --max-time 20 "$_release/manifest" 2>/dev/null)}"
+_manifest_field() { sed -n "s/^$1=\($2\)\$/\1/p" <<<"$_HOMEPOD_SINK_MANIFEST"; }
+_manifest_pkgver=$(_manifest_field pkgver 'r[0-9]\+\.[0-9a-f]\+')
+_manifest_sha256_x86_64=$(_manifest_field sha256_x86_64 '[0-9a-f]\{64\}')
+_manifest_sha256_aarch64=$(_manifest_field sha256_aarch64 '[0-9a-f]\{64\}')
+if [[ -z $_manifest_pkgver || -z $_manifest_sha256_x86_64 || -z $_manifest_sha256_aarch64 ]]; then
+    _manifest_pkgver=r0.0000000 _manifest_sha256_x86_64=SKIP _manifest_sha256_aarch64=SKIP
+fi
+
 pkgname=homepod-sink-bin
-pkgver=r30.7bff20d
+pkgver=$_manifest_pkgver
 pkgrel=1
 pkgdesc="Turns a HomePod into a PipeWire audio output via AirPlay 2 (prebuilt)"
 arch=('x86_64' 'aarch64')
@@ -16,10 +36,10 @@ conflicts=('homepod-sink')
 backup=('etc/homepod-sink/homepod-sink.env.example')
 options=('!debug' '!strip')
 install=homepod-sink.install
-source_x86_64=("$url/releases/download/latest/homepod-sink-$pkgver-x86_64.tar.gz")
-source_aarch64=("$url/releases/download/latest/homepod-sink-$pkgver-aarch64.tar.gz")
-sha256sums_x86_64=('9a85ac627e2e8cad58753ed9a2d28a7f3b0f7408679b4b0da203f7f20b1e3d8a')
-sha256sums_aarch64=('e893d3bf891de6b3db2b9149619dd343abd9669ec8169616753bf484b789f648')
+source_x86_64=("$_release/homepod-sink-$pkgver-x86_64.tar.gz")
+source_aarch64=("$_release/homepod-sink-$pkgver-aarch64.tar.gz")
+sha256sums_x86_64=("$_manifest_sha256_x86_64")
+sha256sums_aarch64=("$_manifest_sha256_aarch64")
 
 package() {
     cd "$srcdir/homepod-sink-$pkgver-$CARCH"

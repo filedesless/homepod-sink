@@ -72,8 +72,11 @@ own `src/` at the repo root):
 - `homepod-sink-bin`: **prebuilt**, from the rolling
   [`latest` release](https://github.com/filedesless/homepod-sink/releases/tag/latest).
   CI (`.github/workflows/release.yml`) rebuilds it for x86_64 and aarch64
-  on every push to master and bumps this PKGBUILD to match, so updating
-  is a download, not a compile.
+  on every push to master, alongside a `manifest` with the version and
+  checksums. The PKGBUILD reads that manifest whenever it's evaluated
+  (paru re-evaluates it on every refresh), so updating is a download, not
+  a compile, and no per-release commit is needed. That lookup is why this
+  PKGBUILD couldn't go on the AUR as-is.
 - `homepod-sink-git`: builds master from source (needs Rust and clang).
 
 They conflict with each other; installing one replaces the other. Build
