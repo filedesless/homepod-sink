@@ -521,6 +521,13 @@ struct StreamerInner {
     sync_anchor: Option<(u64, u64)>,
 }
 
+/// Buffer size for live sources. Everything this buffer holds is delay
+/// between an app and the speaker (on top of the render delay), and the
+/// streamer keeps it 40-50% full - so unlike a file, which buffers 2s, a
+/// live source gets only enough to ride out the capture side's jitter:
+/// PipeWire delivers a chunk every ~21ms.
+const LIVE_BUFFER_MS: u32 = 400;
+
 /// How far the anchored timeline may disagree with the actual clock before
 /// it is re-anchored. Far above the encode loop's jitter, so it only fires
 /// when the wall clock is stepped (CLOCK_REALTIME vs. the monotonic clock
@@ -872,6 +879,7 @@ impl AudioStreamer {
             let mut inner = self.inner.lock().await;
             inner.live_decoder = Some(live_decoder);
             inner.decoder = None; // Clear file decoder if any
+            inner.buffer = AudioBuffer::new(inner.config.audio_format.clone(), LIVE_BUFFER_MS);
             inner.encoder = Some(create_encoder(inner.config.audio_format.clone())?);
             inner.state = StreamerState::Buffering;
             frame_duration_ns = inner.config.audio_format.frames_per_packet as u64
@@ -882,12 +890,11 @@ impl AudioStreamer {
 
         // For live streaming, wait for initial buffer fill before streaming.
         // This prevents startup artifacts from sending packets before we have
-        // enough audio data buffered. Target ~500ms of buffer (about 60 packets
-        // at 352 frames/packet, 44.1kHz).
+        // enough audio data buffered.
         tracing::info!("Live streaming: waiting for initial buffer fill...");
         let buffer_start = std::time::Instant::now();
         let max_wait = std::time::Duration::from_secs(5);
-        let target_fill_pct = 50.0; // Wait for 50% of 2000ms buffer = 1000ms
+        let target_fill_pct = 50.0; // 50% of LIVE_BUFFER_MS
 
         loop {
             // Try to decode some frames into the buffer
