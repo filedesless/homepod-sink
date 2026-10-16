@@ -224,6 +224,18 @@ pub struct Connection {
     stream_stats: Arc<super::stats::StreamStats>,
 }
 
+impl Drop for Connection {
+    /// Backstop for a connection dropped without `disconnect()`, e.g. when
+    /// `setup()` fails partway: stop the background work it started. The
+    /// timing server stops itself when dropped.
+    fn drop(&mut self) {
+        self.control_stop.store(true, Ordering::Release);
+        if let Some(task) = self.timing_task.take() {
+            task.abort();
+        }
+    }
+}
+
 impl Connection {
     /// Create new connection to device.
     pub async fn connect(device: Device, config: StreamConfig) -> Result<Self> {

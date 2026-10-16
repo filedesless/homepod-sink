@@ -271,6 +271,7 @@ async fn stream_to_target<B: tokio_stream::Stream<Item = BrowseEvent> + Unpin>(
     };
     if let Some(volume) = sent_volume {
         if let Err(e) = client.set_initial_volume(volume) {
+            let _ = client.disconnect().await;
             return Ok(StreamOutcome::ConnectionLost(e.into()));
         }
     }
@@ -280,6 +281,8 @@ async fn stream_to_target<B: tokio_stream::Stream<Item = BrowseEvent> + Unpin>(
 
     if let Err(e) = client.start_live_streaming_with_decoder(decoder).await {
         state.sink_manager.set_active_target(None);
+        // Also stops the control thread, which may already be running.
+        let _ = client.disconnect().await;
         return Ok(StreamOutcome::ConnectionLost(e.into()));
     }
 

@@ -316,12 +316,26 @@ impl NtpTimingServer {
                         }
                     }
                 }
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                // `changed()` errors once the sender is gone (the server
+                // was dropped without `stop()`), and keeps erroring on every
+                // poll - treat that as shutdown, or this loop spins a core.
+                changed = shutdown_rx.changed() => {
+                    if changed.is_err() || *shutdown_rx.borrow() {
                         break;
                     }
                 }
             }
+        }
+    }
+}
+
+impl Drop for NtpTimingServer {
+    /// A server dropped without `stop()` (e.g. a connection whose SETUP
+    /// failed) must not leave its task behind.
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(handle) = self.task_handle.take() {
+            handle.abort();
         }
     }
 }
@@ -596,6 +610,18 @@ mod tests {
             assert!(response.send_time > 0);
 
             server.stop().await;
+        }
+
+        #[tokio::test]
+        async fn run_loop_exits_when_shutdown_sender_dropped() {
+            let socket = Arc::new(TokioUdpSocket::bind("127.0.0.1:0").await.unwrap());
+            let (shutdown_tx, shutdown_rx) = watch::channel(false);
+            let task = tokio::spawn(NtpTimingServer::run_loop(socket, Clock::new(44100), shutdown_rx));
+            drop(shutdown_tx);
+            tokio::time::timeout(std::time::Duration::from_secs(1), task)
+                .await
+                .expect("run_loop kept running after its shutdown sender was dropped")
+                .unwrap();
         }
     }
 }

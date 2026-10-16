@@ -1,8 +1,7 @@
 //! Main AirPlay client API.
 
-use crate::airplay::core::{Device, DeviceId, StreamConfig, error::Result};
+use crate::airplay::core::{Device, StreamConfig, error::Result};
 use crate::airplay::core::error::{Error, RtspError};
-use crate::airplay::discovery::{ServiceBrowser, Discovery};
 use crate::airplay::audio::{AudioDecoder, LiveAudioDecoder, LiveFrameSender, EqConfig, EqParams, SpatialParams, SpeakerConfig};
 use std::sync::Arc;
 use std::path::Path;
@@ -11,7 +10,6 @@ use super::{Connection, PlaybackState, EventHandler, ClientEvent};
 
 /// High-level AirPlay 2 sender client.
 pub struct AirPlayClient {
-    browser: ServiceBrowser,
     connection: Option<Connection>,
     event_handler: Option<Box<dyn EventHandler>>,
     stream_config: StreamConfig,
@@ -26,7 +24,6 @@ impl AirPlayClient {
     /// Create new client.
     pub fn new() -> Result<Self> {
         Ok(Self {
-            browser: ServiceBrowser::new()?,
             connection: None,
             event_handler: None,
             stream_config: StreamConfig::default(),
@@ -38,7 +35,6 @@ impl AirPlayClient {
     /// Create client with specific configuration.
     pub fn with_config(config: StreamConfig, event_handler: Option<Box<dyn EventHandler>>) -> Result<Self> {
         Ok(Self {
-            browser: ServiceBrowser::new()?,
             connection: None,
             event_handler,
             stream_config: config,
@@ -71,16 +67,6 @@ impl AirPlayClient {
         }
     }
 
-    /// Discover AirPlay devices on the network.
-    pub async fn discover(&self, timeout: Duration) -> Result<Vec<Device>> {
-        self.browser.scan(timeout).await
-    }
-
-    /// Get a specific device by ID.
-    pub async fn get_device(&self, id: &DeviceId) -> Option<Device> {
-        self.browser.get_device(id).await
-    }
-
     /// Connect to a device.
     pub async fn connect(&mut self, device: &Device) -> Result<()> {
         // Disconnect existing connection if any
@@ -98,7 +84,7 @@ impl AirPlayClient {
         connection.set_render_delay_ms(self.render_delay_ms);
 
         // Complete RTSP SETUP handshake (CRITICAL - required before streaming)
-        connection.setup().await?;
+        Self::setup_or_disconnect(&mut connection).await?;
 
         self.connection = Some(connection);
 
@@ -124,12 +110,24 @@ impl AirPlayClient {
         connection.set_render_delay_ms(self.render_delay_ms);
 
         // Complete RTSP SETUP handshake (CRITICAL - required before streaming)
-        connection.setup().await?;
+        Self::setup_or_disconnect(&mut connection).await?;
 
         self.connection = Some(connection);
 
         self.emit_event(ClientEvent::Connected(device.clone())).await;
 
+        Ok(())
+    }
+
+    /// Run `connection.setup()`, tearing the half-set-up session down if it
+    /// fails so its timing server and control thread don't outlive it.
+    async fn setup_or_disconnect(connection: &mut Connection) -> Result<()> {
+        if let Err(e) = connection.setup().await {
+            // TEARDOWN on a half-set-up session may fail too; the setup
+            // error is the one worth reporting.
+            let _ = connection.disconnect().await;
+            return Err(e);
+        }
         Ok(())
     }
 
@@ -516,41 +514,6 @@ mod tests {
             // Note: Default panics if creation fails, so we use new() for testing
             if let Ok(client) = AirPlayClient::new() {
                 assert!(!client.is_connected());
-            }
-        }
-    }
-
-    mod discovery {
-        use super::*;
-
-        #[tokio::test]
-        async fn discover_returns_devices() {
-            // Skip if mDNS not available
-            if let Ok(client) = AirPlayClient::new() {
-                // Very short timeout - we don't expect to find devices in tests
-                let devices = client.discover(Duration::from_millis(100)).await;
-                assert!(devices.is_ok());
-            }
-        }
-
-        #[tokio::test]
-        async fn discover_respects_timeout() {
-            if let Ok(client) = AirPlayClient::new() {
-                let start = std::time::Instant::now();
-                let _ = client.discover(Duration::from_millis(200)).await;
-                let elapsed = start.elapsed();
-                // Should complete within a reasonable time of the timeout
-                assert!(elapsed >= Duration::from_millis(200));
-                assert!(elapsed < Duration::from_secs(2));
-            }
-        }
-
-        #[tokio::test]
-        async fn get_device_returns_none_for_unknown() {
-            if let Ok(client) = AirPlayClient::new() {
-                let unknown_id = DeviceId([0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x00]);
-                let result = client.get_device(&unknown_id).await;
-                assert!(result.is_none());
             }
         }
     }

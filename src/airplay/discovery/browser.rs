@@ -23,6 +23,13 @@ pub struct ServiceBrowser {
     running: Arc<AtomicBool>,
 }
 
+impl Drop for ServiceBrowser {
+    /// mdns-sd's daemon thread (and its sockets) only exits on `shutdown()`.
+    fn drop(&mut self) {
+        let _ = self.daemon.shutdown();
+    }
+}
+
 impl ServiceBrowser {
     /// Create a new service browser.
     pub fn new() -> Result<Self> {
