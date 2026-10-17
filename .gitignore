@@ -7,3 +7,6 @@
 /arch/*.tar.gz
 *.pkg.tar.zst
 *.pkg.tar.zst.sig
+
+# nix build
+/result

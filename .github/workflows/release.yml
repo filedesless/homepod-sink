@@ -9,7 +9,7 @@ on:
     branches: [master]
     # Nothing in the binaries or the tarball changes: docs, and the
     # PKGBUILDs (which read the release, they aren't part of it).
-    paths-ignore: ['**.md', 'arch/**', '.gitignore']
+    paths-ignore: ['**.md', 'arch/**', '.gitignore', 'flake.nix', 'flake.lock']
   workflow_dispatch:
 
 # One release at a time: each run moves the "latest" tag and replaces its
