@@ -15,5 +15,7 @@ fi
 
 : "${HOMEPOD_SAMPLE_RATE:=48000}"
 : "${HOMEPOD_RENDER_DELAY_MS:=250}"
+: "${HOMEPOD_UDP_PORT_BASE:=6001}"
 
-exec "$SINK" --sample-rate "$HOMEPOD_SAMPLE_RATE" --render-delay-ms "$HOMEPOD_RENDER_DELAY_MS"
+exec "$SINK" --sample-rate "$HOMEPOD_SAMPLE_RATE" --render-delay-ms "$HOMEPOD_RENDER_DELAY_MS" \
+    --udp-port-base "$HOMEPOD_UDP_PORT_BASE"

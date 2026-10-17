@@ -25,6 +25,9 @@ post_install() {
     echo "==> device it finds on the network - pick which one to use from your"
     echo "==> system's audio output picker (e.g. Noctalia), same as any other"
     echo "==> output device. Nothing to configure to select a target."
+    echo "==> With a firewall, allow the UDP ports the HomePod sends to:"
+    echo "==>   sudo ufw allow homepod-sink"
+    echo "==>   sudo firewall-cmd --permanent --add-service=homepod-sink && sudo firewall-cmd --reload"
 }
 
 post_upgrade() {

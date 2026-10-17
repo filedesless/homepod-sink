@@ -212,6 +212,8 @@ pub struct Connection {
     events_stream: Option<TcpStream>,
     /// Render delay in ms added to NTP timestamps for extra retransmit headroom.
     render_delay_ms: u32,
+    /// First local UDP port for the timing/control pair (0 = random ports).
+    udp_port_base: u16,
     /// Equalizer configuration (set before streaming).
     eq_config: Option<EqConfig>,
     /// Shared equalizer parameters for real-time control.
@@ -348,6 +350,7 @@ impl Connection {
             control_stop: Arc::new(AtomicBool::new(false)),
             events_stream: None,
             render_delay_ms: 0,
+            udp_port_base: 0,
             eq_config: None,
             eq_params: None,
             spatial_params: None,
@@ -513,6 +516,7 @@ impl Connection {
             control_stop: Arc::new(AtomicBool::new(false)),
             events_stream: None,
             render_delay_ms: 0,
+            udp_port_base: 0,
             eq_config: None,
             eq_params: None,
             spatial_params: None,
@@ -714,6 +718,7 @@ impl Connection {
             control_stop: Arc::new(AtomicBool::new(false)),
             events_stream: None,
             render_delay_ms: 0,
+            udp_port_base: 0,
             eq_config: None,
             eq_params: None,
             spatial_params: None,
@@ -740,15 +745,14 @@ impl Connection {
         // always uses NTP timing (StreamConfig::realtime_ntp()) — PTP existed
         // here only to back multi-room/stereo-pair group streaming, which
         // this project doesn't use and has removed.
-        let local_timing_port = {
-            let timing_server = NtpTimingServer::start(
-                self.stream_config.audio_format.sample_rate.as_hz()
-            ).await?;
-            let port = timing_server.port();
-            tracing::info!("Started NTP timing server on port {}", port);
-            self.timing_server = Some(timing_server);
-            port
-        };
+        //
+        // The receiver also sends to our control port (retransmit requests).
+        // Both are unsolicited inbound UDP to a firewall, so they're bound
+        // as a pair at fixed, documented ports that a rule can name.
+        let (timing_server, control_receiver, actual_control_port) = self.bind_timing_and_control().await?;
+        let local_timing_port = timing_server.port();
+        tracing::info!("Started NTP timing server on port {}", local_timing_port);
+        self.timing_server = Some(timing_server);
 
         // SETUP Phase 1 (timing/event channels)
         let local_addresses = self.rtsp.local_addr()
@@ -810,11 +814,9 @@ impl Connection {
             }
         }
 
-        // Bind a real UDP socket for the control port before SETUP phase 2.
+        // The control socket (bound above) must exist before SETUP phase 2.
         // The receiver sends RTCP/retransmit-request packets to this port;
         // without a bound socket it gets ICMP "port unreachable" and may mute the stream.
-        let mut control_receiver = RtpReceiver::new();
-        let actual_control_port = control_receiver.bind(0)?;
         self.session.set_local_control_port(actual_control_port);
         tracing::info!("Control port bound to {}", actual_control_port);
         self.control_receiver = Some(Arc::new(control_receiver));
@@ -822,7 +824,16 @@ impl Connection {
         // SETUP Phase 2 (audio stream)
         let setup2_body = self.session.build_setup_phase2()?;
         let setup2_req = RtspRequest::setup(self.session.request_uri(), setup2_body);
-        let setup2_resp = self.rtsp.send(setup2_req).await?;
+        // The receiver doesn't answer this until it has synced to our
+        // timing server, so with its requests dropped on the way in, this
+        // times out (after 20s) having never seen one.
+        let setup2_resp = match self.rtsp.send(setup2_req).await {
+            Ok(resp) => resp,
+            Err(_) if self.timing_requests_received() == 0 => {
+                return Err(CoreError::TimingBlocked { port: local_timing_port });
+            }
+            Err(e) => return Err(e),
+        };
         tracing::debug!(
             "SETUP phase 2 response: status={}, body_len={}, has_body={}",
             setup2_resp.status_code,
@@ -1403,6 +1414,51 @@ impl Connection {
         self.render_delay_ms = delay_ms;
     }
 
+    /// Set the first local UDP port for the timing/control pair: timing on
+    /// `base`, control on `base + 1`, or the next free pair up to
+    /// `UDP_PORT_PAIRS` pairs on. 0 (the default) binds random ports.
+    ///
+    /// Must be called before `setup()`.
+    pub fn set_udp_port_base(&mut self, base: u16) {
+        self.udp_port_base = base;
+    }
+
+    /// Number of NTP timing requests the receiver has sent us this session.
+    pub fn timing_requests_received(&self) -> u64 {
+        self.timing_server.as_ref().map_or(0, |s| s.requests_received())
+    }
+
+    /// Bind the timing server and control socket to the first free pair at
+    /// or after `udp_port_base`. Falls back to random ports, with a warning,
+    /// if the whole range is taken (only firewalls that allow them will work).
+    async fn bind_timing_and_control(&self) -> Result<(NtpTimingServer, RtpReceiver, u16)> {
+        let sample_rate = self.stream_config.audio_format.sample_rate.as_hz();
+        if self.udp_port_base != 0 {
+            for pair in 0..UDP_PORT_PAIRS {
+                let Some(timing_port) = self.udp_port_base.checked_add(pair * 2) else { break };
+                let Some(control_port) = timing_port.checked_add(1) else { break };
+                let Ok(mut timing_server) = NtpTimingServer::start_on(timing_port, sample_rate).await else {
+                    continue;
+                };
+                let mut control_receiver = RtpReceiver::new();
+                if control_receiver.bind(control_port).is_ok() {
+                    return Ok((timing_server, control_receiver, control_port));
+                }
+                timing_server.stop().await;
+            }
+            warn!(
+                "UDP ports {}-{} are all in use, using random ports instead: \
+                 a firewall will drop the HomePod's timing requests unless it allows them",
+                self.udp_port_base,
+                self.udp_port_base.saturating_add(UDP_PORT_PAIRS * 2 - 1)
+            );
+        }
+        let timing_server = NtpTimingServer::start(sample_rate).await?;
+        let mut control_receiver = RtpReceiver::new();
+        let control_port = control_receiver.bind(0)?;
+        Ok((timing_server, control_receiver, control_port))
+    }
+
     /// Set up the equalizer with shared parameters.
     ///
     /// The EQ will be applied to audio during streaming. Parameters can be
@@ -1622,6 +1678,10 @@ impl Connection {
 }
 
 /// Retransmit requests further apart than this belong to separate loss bursts.
+/// How many timing/control port pairs `set_udp_port_base` tries, so several
+/// sessions (or a reconnect overlapping the old one) can be up at once.
+pub const UDP_PORT_PAIRS: u16 = 8;
+
 const LOSS_BURST_GAP: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// One burst of packet loss as reported by the receiver's retransmit

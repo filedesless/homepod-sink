@@ -33,7 +33,7 @@ license=('GPL-3.0-or-later')
 depends=('pipewire' 'gcc-libs' 'glibc')
 provides=('homepod-sink')
 conflicts=('homepod-sink')
-backup=('etc/homepod-sink/homepod-sink.env.example')
+backup=('etc/homepod-sink/homepod-sink.env.example' 'etc/ufw/applications.d/homepod-sink')
 options=('!debug' '!strip')
 install=homepod-sink.install
 source_x86_64=("$_release/homepod-sink-$pkgver-x86_64.tar.gz")
@@ -52,6 +52,10 @@ package() {
         "$pkgdir/usr/lib/systemd/user/homepod-sink.service"
     install -Dm644 homepod-sink.env.example \
         "$pkgdir/etc/homepod-sink/homepod-sink.env.example"
+
+    install -Dm644 homepod-sink.ufw "$pkgdir/etc/ufw/applications.d/homepod-sink"
+    install -Dm644 homepod-sink.xml \
+        "$pkgdir/usr/lib/firewalld/services/homepod-sink.xml"
 
     install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
     install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"

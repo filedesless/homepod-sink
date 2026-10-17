@@ -1,0 +1,10 @@
+# ufw application profile, installed to /etc/ufw/applications.d/homepod-sink.
+# Enable with: sudo ufw allow homepod-sink
+#
+# The HomePod sends NTP timing requests and retransmit requests to these
+# ports, unsolicited, so a default-deny firewall drops them. They match
+# homepod-sink's default --udp-port-base (6001) and the 8 pairs above it.
+[homepod-sink]
+title=homepod-sink (AirPlay sender)
+description=UDP ports the HomePod sends timing and retransmit requests to
+ports=6001:6016/udp

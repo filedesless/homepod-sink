@@ -92,8 +92,9 @@ picks up new builds from then on. To build from source instead, see
 
 The package installs both binaries to `/usr/lib/homepod-sink/`
 (deliberately not on `PATH`), plus a systemd user unit at
-`/usr/lib/systemd/user/homepod-sink.service` and an env file template at
-`/etc/homepod-sink/homepod-sink.env.example`.
+`/usr/lib/systemd/user/homepod-sink.service`, an env file template at
+`/etc/homepod-sink/homepod-sink.env.example`, and firewall rules for ufw and
+firewalld (see [Firewall](#firewall)).
 
 **Switching from a manual/from-source install:** if you already have a unit
 at `~/.config/systemd/user/homepod-sink.service` (e.g. from following the
@@ -151,6 +152,7 @@ streaming to Living Room at 48000Hz stereo
 
 | Flag | Default | Description |
 |---|---|---|
+| `--udp-port-base` | `6001` | First local UDP port the HomePod sends to: timing requests on it, retransmit requests on the next one. Uses the next free pair if taken, up to 15 above the base. `0` picks random ports. See [Firewall](#firewall). |
 | `--sample-rate` | `48000` | Sample rate for every virtual sink. Should match your PipeWire graph's clock rate (`pw-metadata -n settings \| grep clock.rate`) — a mismatch makes PipeWire insert its own rate converter, which has been observed to silently produce zero-valued (silent) samples on this setup. Resampled to 44.1kHz for AirPlay internally regardless. |
 
 **`play`** (diagnostic only)
@@ -176,9 +178,39 @@ row), it checks whether the device still answers on its AirPlay port:
   retries with exponential backoff (2s up to 30s) for as long as audio
   keeps playing into the sink.
 
+If setup times out without a single timing request arriving, the log says
+`no timing requests received from it - inbound UDP to port N is probably
+blocked by a firewall` and it keeps retrying instead: see
+[Firewall](#firewall).
+
 Every sink's PipeWire node stays alive throughout. Audio routed to a
 disconnected one is dropped, not buffered, so nothing needs to be
 restarted.
+
+## Firewall
+
+Unlike most outgoing streams, AirPlay needs a few **inbound** UDP ports. The
+HomePod sends NTP timing requests to one port and retransmit requests for lost
+packets to another, from random source ports, so connection tracking can't
+treat them as replies. A default-deny firewall drops them, and the HomePod
+gives up on every session about 20 seconds in.
+
+`homepod-sink` binds them as a pair: timing on `--udp-port-base` (default
+`6001`) and control on the next port. If that pair is taken, for example by a
+second session during a reconnect, it uses the next one up, at most 8 pairs.
+So allow **UDP 6001-6016**. The Arch package ships rules for both common
+firewalls:
+
+```sh
+sudo ufw allow homepod-sink                    # /etc/ufw/applications.d/homepod-sink
+sudo firewall-cmd --permanent --add-service=homepod-sink && sudo firewall-cmd --reload
+```
+
+Without the package, use `sudo ufw allow 6001:6016/udp`, or copy
+`firewall/homepod-sink.ufw` or `firewall/homepod-sink.xml` into place. If you
+change the base (`HOMEPOD_UDP_PORT_BASE` in the env file), shift the range to
+match. Discovery needs mDNS (UDP 5353) too, which ufw and firewalld's default
+zones already allow.
 
 ## Running as a systemd service
 
@@ -201,9 +233,10 @@ systemctl --user daemon-reload
 systemctl --user enable --now homepod-sink
 ```
 
-`systemd/run.sh` reads two environment variables (see
+`systemd/run.sh` reads three environment variables (see
 `systemd/homepod-sink.env.example`): `HOMEPOD_SAMPLE_RATE` (default
-`48000`), mapped to `homepod-sink --sample-rate`, and
+`48000`), mapped to `homepod-sink --sample-rate`,
+`HOMEPOD_UDP_PORT_BASE` (default `6001`), mapped to `--udp-port-base`, and
 `HOMEPOD_RENDER_DELAY_MS` (default `250`), mapped to
 `--render-delay-ms`. The HomePod buffers another 250ms on top of the render
 delay, and lost packets can be resent within both, so the default gives a

@@ -34,6 +34,9 @@ pub enum Error {
 
     #[error("Operation timed out")]
     Timeout,
+
+    #[error("no timing requests received from the device: inbound UDP to port {port} is probably blocked by a firewall")]
+    TimingBlocked { port: u16 },
 }
 
 /// Errors during mDNS service discovery.

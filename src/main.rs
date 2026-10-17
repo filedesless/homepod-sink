@@ -7,7 +7,7 @@ use clap::Parser;
 use homepod_sink::airplay::audio::{AlacEncoder, AudioStreamer, LiveAudioDecoder, LiveFrameSender};
 use homepod_sink::airplay::client::AirPlayClient;
 use homepod_sink::airplay::core::device::{Device, DeviceId};
-use homepod_sink::airplay::core::{AudioCodec, StreamConfig};
+use homepod_sink::airplay::core::{AudioCodec, Error, StreamConfig};
 use homepod_sink::airplay::discovery::{Discovery, ServiceBrowser};
 use homepod_sink::airplay::discovery::BrowseEvent;
 use homepod_sink::sink_manager::{Arbiter, SinkEvent, SinkManager};
@@ -34,6 +34,14 @@ struct Args {
     /// the speaker. The HomePod accepts up to 2000.
     #[arg(long, default_value_t = 250, value_parser = clap::value_parser!(u32).range(0..=2000))]
     render_delay_ms: u32,
+
+    /// First local UDP port the HomePod sends to: NTP timing requests on
+    /// this one, retransmit requests on the next. If a pair is taken, the
+    /// next one up is used, so a firewall should allow this port to 15
+    /// above it (6001-6016 by default). 0 picks random ports, which only
+    /// work with no firewall, or one that allows all UDP from the HomePod.
+    #[arg(long, default_value_t = 6001, value_parser = clap::value_parser!(u16).range(0..=65520))]
+    udp_port_base: u16,
 }
 
 /// AirPlay control port. Never varies in practice - not worth a flag.
@@ -150,7 +158,17 @@ async fn run(args: Args) -> Result<()> {
         );
 
         match stream_to_target(&device, &args, &mut state, &mut retry_delay).await? {
-            StreamOutcome::Retarget => {}
+            StreamOutcome::Retarget => continue,
+            StreamOutcome::TimingBlocked(port) => {
+                // Not a takeover, even though the device is still
+                // reachable: keep retrying, in case the firewall opens.
+                tracing::error!(
+                    "couldn't connect to {}: no timing requests received from it - \
+                     inbound UDP to port {} is probably blocked by a firewall \
+                     (see \"Firewall\" in the README). Retrying in {:?}",
+                    device.name, port, retry_delay
+                );
+            }
             StreamOutcome::ConnectionLost(err) => {
                 tracing::warn!("connection to {} lost: {:#}", device.name, err);
 
@@ -168,19 +186,19 @@ async fn run(args: Args) -> Result<()> {
                     retry_delay = MIN_RETRY_DELAY;
                     continue;
                 }
-
-                // Otherwise it's gone (power, Wi-Fi, new DHCP address):
-                // retry with backoff, while still handling events so a
-                // stop or switch takes effect immediately.
                 tracing::info!("{} is unreachable, retrying in {:?}", device.name, retry_delay);
-                let deadline = tokio::time::Instant::now() + retry_delay;
-                retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
-                while state.target(Some(&device.id)) == Some(device.id.clone()) {
-                    match tokio::time::timeout_at(deadline, state.next_event()).await {
-                        Ok(result) => result?,
-                        Err(_elapsed) => break,
-                    }
-                }
+            }
+        }
+
+        // It's gone (power, Wi-Fi, new DHCP address) or blocked: retry with
+        // backoff, while still handling events so a stop or switch takes
+        // effect immediately.
+        let deadline = tokio::time::Instant::now() + retry_delay;
+        retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
+        while state.target(Some(&device.id)) == Some(device.id.clone()) {
+            match tokio::time::timeout_at(deadline, state.next_event()).await {
+                Ok(result) => result?,
+                Err(_elapsed) => break,
             }
         }
     }
@@ -192,6 +210,9 @@ enum StreamOutcome {
     Retarget,
     /// The connection itself failed/died.
     ConnectionLost(anyhow::Error),
+    /// Setup timed out without a single timing request reaching our
+    /// timing port (this one): inbound UDP is being blocked.
+    TimingBlocked(u16),
 }
 
 /// Whether `device` accepts a TCP connection on its AirPlay control port.
@@ -244,12 +265,15 @@ async fn stream_to_target<B: tokio_stream::Stream<Item = BrowseEvent> + Unpin>(
         Err(e) => return Ok(StreamOutcome::ConnectionLost(e.into())),
     };
     client.set_render_delay_ms(args.render_delay_ms);
+    client.set_udp_port_base(args.udp_port_base);
 
     let mut device = device.clone();
     device.port = AIRPLAY_PORT;
 
-    if let Err(e) = client.connect(&device).await {
-        return Ok(StreamOutcome::ConnectionLost(e.into()));
+    match client.connect(&device).await {
+        Ok(()) => {}
+        Err(Error::TimingBlocked { port }) => return Ok(StreamOutcome::TimingBlocked(port)),
+        Err(e) => return Ok(StreamOutcome::ConnectionLost(e.into())),
     }
 
     // Starting to stream always sends a volume, and the HomePod has one

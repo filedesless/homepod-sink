@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- firewalld service, installed to /usr/lib/firewalld/services/.
+     Enable with: sudo firewall-cmd --permanent --add-service=homepod-sink
+     then: sudo firewall-cmd --reload -->
+<service>
+  <short>homepod-sink</short>
+  <description>UDP ports the HomePod sends NTP timing requests and retransmit requests to. They match homepod-sink's default --udp-port-base (6001) and the 8 pairs above it.</description>
+  <port protocol="udp" port="6001-6016"/>
+</service>

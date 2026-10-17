@@ -16,6 +16,8 @@ pub struct AirPlayClient {
     /// Render delay in ms added to NTP timestamps for extra retransmit headroom.
     /// Default: 200ms for reliable playback over WiFi.
     render_delay_ms: u32,
+    /// First local UDP port for the timing/control pair (0 = random ports).
+    udp_port_base: u16,
     /// Stream statistics (shared across all streaming threads).
     stream_stats: Arc<super::stats::StreamStats>,
 }
@@ -28,6 +30,7 @@ impl AirPlayClient {
             event_handler: None,
             stream_config: StreamConfig::default(),
             render_delay_ms: 200, // 200ms default for reliable playback over WiFi
+            udp_port_base: 0,
             stream_stats: super::stats::StreamStats::new(),
         })
     }
@@ -39,6 +42,7 @@ impl AirPlayClient {
             event_handler,
             stream_config: config,
             render_delay_ms: 200, // 200ms default for reliable playback over WiFi
+            udp_port_base: 0,
             stream_stats: super::stats::StreamStats::new(),
         })
     }
@@ -58,6 +62,13 @@ impl AirPlayClient {
     /// Must be called before `connect()`.
     pub fn set_render_delay_ms(&mut self, delay_ms: u32) {
         self.render_delay_ms = delay_ms;
+    }
+
+    /// Set the first local UDP port for the timing/control ports the
+    /// receiver sends to (see `Connection::set_udp_port_base`). 0, the
+    /// default, binds random ports. Must be called before `connect()`.
+    pub fn set_udp_port_base(&mut self, base: u16) {
+        self.udp_port_base = base;
     }
 
     /// Emit an event if handler is set.
@@ -82,6 +93,7 @@ impl AirPlayClient {
 
         // Set render delay for retransmit headroom
         connection.set_render_delay_ms(self.render_delay_ms);
+        connection.set_udp_port_base(self.udp_port_base);
 
         // Complete RTSP SETUP handshake (CRITICAL - required before streaming)
         Self::setup_or_disconnect(&mut connection).await?;
@@ -108,6 +120,7 @@ impl AirPlayClient {
 
         // Set render delay for retransmit headroom
         connection.set_render_delay_ms(self.render_delay_ms);
+        connection.set_udp_port_base(self.udp_port_base);
 
         // Complete RTSP SETUP handshake (CRITICAL - required before streaming)
         Self::setup_or_disconnect(&mut connection).await?;

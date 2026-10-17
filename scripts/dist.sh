@@ -19,6 +19,8 @@ install -m644 "$root/systemd/homepod-sink-installed.service" \
     "$stage/$name/homepod-sink.service"
 install -m644 "$root/systemd/homepod-sink.env.example" \
     "$root/README.md" "$root/LICENSE" "$stage/$name/"
+install -m644 "$root/firewall/homepod-sink.ufw" "$root/firewall/homepod-sink.xml" \
+    "$stage/$name/"
 
 # Reproducible-ish: fixed owner and mtime, sorted entries.
 tar --sort=name --owner=0 --group=0 --numeric-owner \

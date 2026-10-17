@@ -9,6 +9,7 @@ use super::Clock;
 use super::ntp_to_unix;
 use crate::airplay::core::error::{Error, Result};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::net::UdpSocket as TokioUdpSocket;
 use tokio::sync::watch;
 
@@ -241,6 +242,9 @@ pub struct NtpTimingServer {
     #[allow(dead_code)]
     socket: Arc<TokioUdpSocket>,
     port: u16,
+    /// Timing requests answered so far. Zero long after setup means none
+    /// are getting through - usually a firewall dropping them.
+    requests: Arc<AtomicU64>,
     shutdown_tx: watch::Sender<bool>,
     task_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -248,21 +252,30 @@ pub struct NtpTimingServer {
 impl NtpTimingServer {
     /// Bind to a random port and start the background listener.
     pub async fn start(sample_rate: u32) -> Result<Self> {
-        let socket = TokioUdpSocket::bind("0.0.0.0:0").await?;
+        Self::start_on(0, sample_rate).await
+    }
+
+    /// Bind to `port` (0 for a random one) and start the background listener.
+    pub async fn start_on(port: u16, sample_rate: u32) -> Result<Self> {
+        let socket = TokioUdpSocket::bind(("0.0.0.0", port)).await?;
         let port = socket.local_addr()?.port();
         let socket = Arc::new(socket);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let clock = Clock::new(sample_rate);
 
+        let requests = Arc::new(AtomicU64::new(0));
+
         let task_socket = socket.clone();
+        let task_requests = requests.clone();
         let task_handle = tokio::spawn(async move {
-            Self::run_loop(task_socket, clock, shutdown_rx).await;
+            Self::run_loop(task_socket, clock, task_requests, shutdown_rx).await;
         });
 
         Ok(Self {
             socket,
             port,
+            requests,
             shutdown_tx,
             task_handle: Some(task_handle),
         })
@@ -271,6 +284,11 @@ impl NtpTimingServer {
     /// Get the local port number.
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Number of timing requests received and answered so far.
+    pub fn requests_received(&self) -> u64 {
+        self.requests.load(Ordering::Relaxed)
     }
 
     /// Stop the timing server.
@@ -300,6 +318,7 @@ impl NtpTimingServer {
     async fn run_loop(
         socket: Arc<TokioUdpSocket>,
         clock: Clock,
+        requests: Arc<AtomicU64>,
         mut shutdown_rx: watch::Receiver<bool>,
     ) {
         let mut buf = [0u8; 64];
@@ -312,6 +331,7 @@ impl NtpTimingServer {
                             let send_time = clock.now_ntp();
                             let response = NtpResponse::from_request(&request, recv_time, send_time);
                             let _ = socket.send_to(&response.serialize(), addr).await;
+                            requests.fetch_add(1, Ordering::Relaxed);
                             tracing::debug!("NTP timing: responded to request seq={}", request.sequence);
                         }
                     }
@@ -608,15 +628,33 @@ mod tests {
             // Receive and send times should be valid NTP timestamps
             assert!(response.receive_time > 0);
             assert!(response.send_time > 0);
+            assert_eq!(server.requests_received(), 1);
 
             server.stop().await;
+        }
+
+        #[tokio::test]
+        async fn start_on_binds_the_requested_port() {
+            let free = std::net::UdpSocket::bind("0.0.0.0:0").unwrap().local_addr().unwrap().port();
+            let mut server = NtpTimingServer::start_on(free, 44100).await.unwrap();
+            assert_eq!(server.port(), free);
+            assert_eq!(server.requests_received(), 0);
+            server.stop().await;
+        }
+
+        #[tokio::test]
+        async fn start_on_fails_when_the_port_is_taken() {
+            let taken = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+            let port = taken.local_addr().unwrap().port();
+            assert!(NtpTimingServer::start_on(port, 44100).await.is_err());
         }
 
         #[tokio::test]
         async fn run_loop_exits_when_shutdown_sender_dropped() {
             let socket = Arc::new(TokioUdpSocket::bind("127.0.0.1:0").await.unwrap());
             let (shutdown_tx, shutdown_rx) = watch::channel(false);
-            let task = tokio::spawn(NtpTimingServer::run_loop(socket, Clock::new(44100), shutdown_rx));
+            let requests = Arc::new(AtomicU64::new(0));
+            let task = tokio::spawn(NtpTimingServer::run_loop(socket, Clock::new(44100), requests, shutdown_rx));
             drop(shutdown_tx);
             tokio::time::timeout(std::time::Duration::from_secs(1), task)
                 .await
